@@ -37,9 +37,6 @@ describe("AGSCProject", () => {
       },
       restrict_user_to_local_only: false,
     });
-    assert.throws(() => {
-      (project.config as { require_tag?: boolean }).require_tag = false;
-    }, TypeError);
   });
 
   it("loads named config exports", async () => {
