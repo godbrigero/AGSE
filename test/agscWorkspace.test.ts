@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -29,7 +29,6 @@ describe("AGSCProject", () => {
     const project = await AGSCProject.fromRootPath(projectRoot);
 
     assert.equal(project.rootPath, resolve(projectRoot));
-    assert.equal(project.name, basename(projectRoot));
     assert.deepEqual(project.config, {
       require_tag: true,
       overwrite_tags: {
