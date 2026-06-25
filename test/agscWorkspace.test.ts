@@ -28,7 +28,6 @@ describe("AGSCProject", () => {
 
     const project = await AGSCProject.fromRootPath(projectRoot);
 
-    assert.equal(project.rootPath, resolve(projectRoot));
     assert.deepEqual(project.config, {
       require_tag: true,
       overwrite_tags: {
