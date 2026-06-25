@@ -25,9 +25,20 @@ describe("parseGitHubRemoteUrl", () => {
     });
   });
 
+  it("parses GitHub SSH URL remotes", () => {
+    assert.deepEqual(parseGitHubRemoteUrl("ssh://git@github.com/owner/repo.git"), {
+      owner: "owner",
+      repo: "repo",
+    });
+  });
+
   it("rejects non-GitHub or incomplete remotes", () => {
     assert.equal(parseGitHubRemoteUrl("https://gitlab.com/owner/repo.git"), null);
     assert.equal(parseGitHubRemoteUrl("https://github.com/owner"), null);
     assert.equal(parseGitHubRemoteUrl("not a remote"), null);
+  });
+
+  it("rejects GitHub URLs with extra path segments", () => {
+    assert.equal(parseGitHubRemoteUrl("https://github.com/owner/repo/pulls"), null);
   });
 });

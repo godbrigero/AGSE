@@ -36,6 +36,15 @@ describe("AGSCStateStore", () => {
     assert.deepEqual(await store.read(), { workflows: [] });
   });
 
+  it("throws when the state file contains invalid JSON", async () => {
+    const projectRoot = await createTempDir();
+    const store = new AGSCStateStore(projectRoot);
+    await mkdir(join(projectRoot, ".agse"), { recursive: true });
+    await writeFile(store.statePath, "{not-json");
+
+    await assert.rejects(() => store.read(), SyntaxError);
+  });
+
   it("persists updated state as formatted JSON", async () => {
     const projectRoot = await createTempDir();
     const store = new AGSCStateStore(projectRoot);

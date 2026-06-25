@@ -100,6 +100,27 @@ describe("CodexWorkflows", () => {
       /did not return a thread id/,
     );
   });
+
+  it("normalizes steer message input and preserves caller params", async () => {
+    const client = new FakeCodexClient();
+    client.enqueueResponse({ accepted: true });
+    const workflows = createWorkflows(client);
+
+    await workflows.steerMessage("thread-1", "Adjust course", {
+      turnId: "turn-1",
+    });
+
+    assert.deepEqual(client.requests, [
+      {
+        method: "turn/steer",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          input: [{ type: "text", text: "Adjust course" }],
+        },
+      },
+    ]);
+  });
 });
 
 type CodexWorkflowTestOptions = ConstructorParameters<typeof CodexWorkflows>[1];

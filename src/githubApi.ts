@@ -211,10 +211,16 @@ export function parseGitHubRemoteUrl(
       return null;
     }
 
-    const [owner, repo] = url.pathname
+    const pathSegments = url.pathname
       .replace(/^\/+/, "")
       .replace(/\.git$/, "")
       .split("/");
+
+    if (pathSegments.length !== 2) {
+      return null;
+    }
+
+    const [owner, repo] = pathSegments;
 
     if (!owner || !repo) {
       return null;

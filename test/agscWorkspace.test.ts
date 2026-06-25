@@ -64,6 +64,18 @@ describe("AGSCProject", () => {
     });
   });
 
+  it("uses an empty config when no recognized config export exists", async () => {
+    const projectRoot = await createProject("empty-config", [
+      "export const ignored = { require_tag: true };",
+    ]);
+
+    assert.deepEqual((await AGSCProject.fromRootPath(projectRoot)).config, {
+      require_tag: undefined,
+      overwrite_tags: undefined,
+      restrict_user_to_local_only: undefined,
+    });
+  });
+
   it("rejects invalid config exports", async () => {
     const nonObjectRoot = await createProject("non-object", [
       "export default null;",
