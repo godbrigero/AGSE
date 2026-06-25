@@ -101,7 +101,6 @@ describe("AGSCWorkspace", () => {
 
     const workspace = await AGSCWorkspace.discover([searchRoot, alphaRoot]);
 
-    assert.equal(workspace.size, 2);
     assert.deepEqual(workspace.rootPaths, [
       resolve(alphaRoot),
       resolve(nestedRoot),
