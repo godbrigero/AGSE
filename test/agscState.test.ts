@@ -23,7 +23,6 @@ describe("AGSCStateStore", () => {
     const projectRoot = await createTempDir();
     const store = new AGSCStateStore(projectRoot);
 
-    await assert.doesNotReject(() => store.read());
     assert.deepEqual(await store.read(), { workflows: [] });
   });
 
