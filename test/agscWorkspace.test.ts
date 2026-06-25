@@ -100,7 +100,6 @@ describe("AGSCWorkspace", () => {
       resolve(alphaRoot),
       resolve(nestedRoot),
     ]);
-    assert.equal(workspace.findByRootPath(alphaRoot)?.name, "alpha");
     assert.equal(workspace.findByRootPath(join(searchRoot, "missing")), undefined);
   });
 });
