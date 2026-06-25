@@ -21,6 +21,12 @@ For type checking:
 npm run typecheck
 ```
 
+For tests:
+
+```sh
+npm test
+```
+
 The app entrypoint is `src/main.ts`. This project intentionally does not compile TypeScript to JavaScript before running.
 
 ## Integrations

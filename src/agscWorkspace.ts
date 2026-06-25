@@ -129,13 +129,25 @@ async function loadAGSCConfigFromProjectRoot(
   const configPath = join(projectRootPath, ROOT_MARKER_FILE_NAME);
   const configUrl = pathToFileURL(configPath).href;
   const configModule = (await import(configUrl)) as AGSCConfigModule;
-  const config =
-    configModule.default ??
-    configModule.config ??
-    configModule.agscConfig ??
-    {};
+  const config = getExportedAGSCConfig(configModule);
 
   return normalizeAGSCConfig(config);
+}
+
+function getExportedAGSCConfig(configModule: AGSCConfigModule): unknown {
+  if ("default" in configModule) {
+    return configModule.default;
+  }
+
+  if ("config" in configModule) {
+    return configModule.config;
+  }
+
+  if ("agscConfig" in configModule) {
+    return configModule.agscConfig;
+  }
+
+  return {};
 }
 
 function normalizeAGSCConfig(config: unknown): Readonly<AGSCConfigOptions> {
