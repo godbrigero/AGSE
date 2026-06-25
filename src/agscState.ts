@@ -13,8 +13,11 @@ export type AGSCTrackedWorkflow = {
   branchName: string;
   pullNumber?: number;
   pullUrl?: string;
+  pullState?: "open" | "closed";
   codexThreadId?: string;
   claudeSessionId?: string;
+  agentHandoffStartedAt?: string;
+  agentHandoffVersion?: number;
   lastPullUpdatedAt?: string;
   lastSyncedPrEventAt?: string;
 };
@@ -80,6 +83,12 @@ export class AGSCStateStore {
     });
 
     return workflow;
+  }
+
+  async removeWorkflow(issueId: number): Promise<void> {
+    await this.update((state) => ({
+      workflows: state.workflows.filter((entry) => entry.issueId !== issueId),
+    }));
   }
 }
 

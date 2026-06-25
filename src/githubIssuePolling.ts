@@ -10,6 +10,8 @@ import {
   type GitHubRepositoryRef,
   type GitHubUser,
 } from "./githubApi.ts";
+import { AGSCStateStore } from "./agscState.ts";
+import { errorMessage, info, style, success, warning } from "./terminalStyle.ts";
 
 export type GitHubIssuePollerOptions = {
   intervalMs?: number;
@@ -20,7 +22,6 @@ export type GitHubIssuePollerOptions = {
 type ProjectIssuePollState = {
   project: AGSCProject;
   repository: GitHubRepositoryRef;
-  lastCreatedAt: Date;
   seenIssueIds: Set<number>;
   isPolling: boolean;
 };
@@ -51,9 +52,19 @@ export class GitHubIssuePoller {
     options: GitHubIssuePollerOptions = {},
   ): Promise<GitHubIssuePoller> {
     const states: ProjectIssuePollState[] = [];
-    const now = options.now ?? (() => new Date());
-    const github = new GitHubApiClient(options.token);
-    const localUser = await github.getAuthenticatedUser();
+    const token = options.token ?? process.env.GITHUB_TOKEN;
+    const github = new GitHubApiClient(token);
+    const localUser = await getLocalGitHubUser(github, Boolean(token));
+
+    if (!token) {
+      console.warn(
+        warning(
+          "[github] GITHUB_TOKEN is not set. AGSE can read public issues, but PR creation and local-only author checks require a token.",
+        ),
+      );
+    } else if (localUser) {
+      console.log(success(`[github] Authenticated as ${localUser.login}.`));
+    }
 
     for (const project of workspace.projects) {
       const remoteUrl = await getOriginRemoteUrl(project);
@@ -61,15 +72,24 @@ export class GitHubIssuePoller {
 
       if (!repository) {
         console.warn(
-          `[github] Skipping ${project.name}: origin remote is not a GitHub repository.`,
+          warning(
+            `[github] Skipping ${project.name}: origin remote is not a GitHub repository.`,
+          ),
         );
         continue;
+      }
+
+      if (project.config.restrict_user_to_local_only && !localUser) {
+        console.warn(
+          warning(
+            `[github] ${project.name} has restrict_user_to_local_only enabled, but no authenticated GitHub user is available.`,
+          ),
+        );
       }
 
       states.push({
         project,
         repository,
-        lastCreatedAt: now(),
         seenIssueIds: new Set<number>(),
         isPolling: false,
       });
@@ -114,41 +134,106 @@ export class GitHubIssuePoller {
     state.isPolling = true;
 
     try {
+      console.log(
+        info(
+          `[github] Polling ${state.project.name} (${state.repository.owner}/${state.repository.repo})...`,
+        ),
+      );
       await syncTrackedPullRequests(state.project, state.repository, this.github);
 
       const issues = await this.github.listRecentIssues(state.repository);
-      const newIssues = issues
-        .filter((issue) => !issue.pull_request)
-        .filter((issue) => isNewIssue(issue, state))
-        .sort(
-          (left, right) =>
-            new Date(left.created_at).getTime() -
-            new Date(right.created_at).getTime(),
-        );
+      const pendingIssues = await this.selectPendingIssues(issues, state);
 
-      for (const issue of newIssues) {
-        state.seenIssueIds.add(issue.id);
-        state.lastCreatedAt = new Date(issue.created_at);
+      console.log(
+        info(
+          `[github] ${state.project.name}: saw ${issues.length} open issue(s), ${pendingIssues.length} pending AGSC check(s).`,
+        ),
+      );
+
+      for (const issue of pendingIssues) {
         logNewIssue(state.project, state.repository, issue);
-        await handleGitHubIssueForProject({
-          project: state.project,
-          repository: state.repository,
-          issue,
-          github: this.github,
-          localGitHubLogin: this.localUser?.login ?? null,
-        });
-      }
+        try {
+          const result = await handleGitHubIssueForProject({
+            project: state.project,
+            repository: state.repository,
+            issue,
+            github: this.github,
+            localGitHubLogin: this.localUser?.login ?? state.repository.owner,
+          });
 
-      if (newIssues.length === 0) {
-        state.lastCreatedAt = maxDate(state.lastCreatedAt, this.now());
+          if (result.status === "tracked") {
+            state.seenIssueIds.add(issue.id);
+          }
+        } catch (error) {
+          console.error(
+            errorMessage(
+              `[github] Failed to automate ${state.project.name} #${issue.number}: ${formatError(error)}`,
+            ),
+          );
+        }
       }
     } catch (error) {
       console.error(
-        `[github] Failed to poll ${state.repository.owner}/${state.repository.repo}: ${formatError(error)}`,
+        errorMessage(
+          `[github] Failed to poll ${state.repository.owner}/${state.repository.repo}: ${formatError(error)}`,
+        ),
       );
     } finally {
       state.isPolling = false;
     }
+  }
+
+  private async selectPendingIssues(
+    issues: GitHubIssue[],
+    state: ProjectIssuePollState,
+  ): Promise<GitHubIssue[]> {
+    const trackedIssueIds = new Set(
+      (await new AGSCStateStore(state.project.rootPath).read()).workflows.map(
+        (workflow) => workflow.issueId,
+      ),
+    );
+
+    return selectPendingIssuesForAutomation(
+      issues,
+      state.seenIssueIds,
+      trackedIssueIds,
+    );
+  }
+}
+
+function selectPendingIssuesForAutomation(
+  issues: readonly GitHubIssue[],
+  seenIssueIds: ReadonlySet<number>,
+  trackedIssueIds: ReadonlySet<number>,
+): GitHubIssue[] {
+  return issues
+    .filter((issue) => !issue.pull_request)
+    .filter(
+      (issue) =>
+        !seenIssueIds.has(issue.id) && !trackedIssueIds.has(issue.id),
+    )
+    .sort(
+      (left, right) =>
+        new Date(left.created_at).getTime() -
+        new Date(right.created_at).getTime(),
+    );
+}
+
+async function getLocalGitHubUser(
+  github: GitHubApiClient,
+  hasToken: boolean,
+): Promise<GitHubUser | null> {
+  if (!hasToken) {
+    return null;
+  }
+
+  try {
+    return await github.getAuthenticatedUser();
+  } catch (error) {
+    console.warn(
+      warning(`[github] Could not authenticate GITHUB_TOKEN: ${formatError(error)}`),
+    );
+    return null;
   }
 }
 
@@ -164,15 +249,6 @@ async function getOriginRemoteUrl(
   }
 }
 
-function isNewIssue(
-  issue: GitHubIssue,
-  state: ProjectIssuePollState,
-): boolean {
-  const createdAt = new Date(issue.created_at);
-
-  return createdAt > state.lastCreatedAt && !state.seenIssueIds.has(issue.id);
-}
-
 function logNewIssue(
   project: AGSCProject,
   repository: GitHubRepositoryRef,
@@ -181,15 +257,15 @@ function logNewIssue(
   const author = issue.user?.login ? ` by ${issue.user.login}` : "";
 
   console.log(
-    `[github] ${project.name} ${repository.owner}/${repository.repo} #${issue.number}${author}: ${issue.title}`,
+    `${style.magenta("[github]")} ${project.name} ${repository.owner}/${repository.repo} #${issue.number}${author}: ${style.bold(issue.title)}`,
   );
-  console.log(`         ${issue.html_url}`);
-}
-
-function maxDate(left: Date, right: Date): Date {
-  return left > right ? left : right;
+  console.log(style.dim(`         ${issue.html_url}`));
 }
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+export const __testing = {
+  selectPendingIssuesForAutomation,
+};

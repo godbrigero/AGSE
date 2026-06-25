@@ -45,6 +45,9 @@ const config: AGSCWorkspaceConfig = {
     claude: "agse-claude",
     default: "agse",
   },
+  assignee_tags: {
+    godbrigero: "codex",
+  },
   restrict_user_to_local_only: true,
 };
 
@@ -64,3 +67,12 @@ for (const project of workspace.projects) {
   console.log(await project.claude.listChats({ limit: 5 }));
 }
 ```
+
+## Issue routing
+
+- Label `agse-codex` routes an issue to Codex.
+- Label `agse-claude` routes an issue to Claude.
+- Label `agse` routes an issue to the default agent, currently Codex.
+- `assignee_tags` can route by GitHub assignee username, for example `godbrigero: "codex"`.
+- If `require_tag` is `true`, an issue needs a matching label or configured assignee route.
+- If `restrict_user_to_local_only` is `true`, AGSE only acts on issues opened by the authenticated `GITHUB_TOKEN` user.

@@ -54,6 +54,12 @@ export type SendCodexMessageResult = {
   notifications: readonly CodexNotification[];
 };
 
+export type StartCodexDetachedTurnResult = {
+  threadId: string;
+  turnId?: string;
+  turn: unknown;
+};
+
 export type SendCodexMessageOptions = Omit<
   SendCodexMessageInput,
   "threadId" | "input"
@@ -145,6 +151,10 @@ export class CodexWorkflows {
     return this.request("thread/unarchive", { threadId });
   }
 
+  async renameChat(threadId: string, title: string): Promise<unknown> {
+    return this.request("thread/rename", { threadId, title });
+  }
+
   async sendMessage(
     threadId: string,
     input: CodexMessageInput,
@@ -213,6 +223,22 @@ export class CodexWorkflows {
       completed: completedNotification,
       finalResponse,
       notifications,
+    };
+  }
+
+  async startTurnDetached(
+    input: SendCodexMessageInput,
+  ): Promise<StartCodexDetachedTurnResult> {
+    const turn = await this.request("turn/start", {
+      ...this.turnDefaults(),
+      ...withoutTimeout(input),
+      input: normalizeInput(input.input),
+    });
+
+    return {
+      threadId: input.threadId,
+      turnId: extractTurnIdFromValue(turn),
+      turn,
     };
   }
 
@@ -428,3 +454,12 @@ function extractTurnIdFromValue(value: unknown): string | undefined {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+export const __testing = {
+  extractAgentMessageDelta,
+  extractTurnId,
+  extractTurnIdFromValue,
+  normalizeInput,
+  normalizeThread,
+  withoutTimeout,
+};

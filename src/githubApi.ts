@@ -17,9 +17,11 @@ export type GitHubIssue = {
   title: string;
   body: string | null;
   html_url: string;
+  state: "open" | "closed";
   created_at: string;
   updated_at: string;
   user?: GitHubUser;
+  assignees?: GitHubUser[];
   labels: GitHubLabel[];
   pull_request?: unknown;
 };
@@ -93,6 +95,15 @@ export class GitHubApiClient {
     url.searchParams.set("per_page", "30");
 
     return this.request<GitHubIssue[]>(url);
+  }
+
+  async getIssue(
+    repository: GitHubRepositoryRef,
+    issueNumber: number,
+  ): Promise<GitHubIssue> {
+    return this.request<GitHubIssue>(
+      this.repoUrl(repository, `issues/${issueNumber}`),
+    );
   }
 
   async listOpenPullRequestsForHead(

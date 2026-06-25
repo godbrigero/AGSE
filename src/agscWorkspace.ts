@@ -81,6 +81,14 @@ export class AGSCWorkspace {
     options: AGSCWorkspaceOptions = {},
   ): Promise<AGSCWorkspace> {
     const projectRootPaths = await findRootFoldersWithFile(folderPaths);
+
+    return AGSCWorkspace.fromRootPaths(projectRootPaths, options);
+  }
+
+  static async fromRootPaths(
+    projectRootPaths: readonly string[],
+    options: AGSCWorkspaceOptions = {},
+  ): Promise<AGSCWorkspace> {
     const projects = await Promise.all(
       projectRootPaths.map((projectRootPath) =>
         AGSCProject.fromRootPath(projectRootPath, options),
@@ -146,6 +154,7 @@ function normalizeAGSCConfig(config: unknown): Readonly<AGSCConfigOptions> {
   return Object.freeze({
     require_tag: optionalBoolean(config.require_tag, "require_tag"),
     overwrite_tags: optionalOverwriteTags(config.overwrite_tags),
+    assignee_tags: optionalAssigneeTags(config.assignee_tags),
     restrict_user_to_local_only: optionalBoolean(
       config.restrict_user_to_local_only,
       "restrict_user_to_local_only",
@@ -184,6 +193,32 @@ function optionalOverwriteTags(
     claude: requiredString(value.claude, "overwrite_tags.claude"),
     default: requiredString(value.default, "overwrite_tags.default"),
   };
+}
+
+function optionalAssigneeTags(
+  value: unknown,
+): AGSCConfigOptions["assignee_tags"] {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!isRecord(value)) {
+    throw new Error('AGSC config field "assignee_tags" must be an object.');
+  }
+
+  const assigneeTags: Record<string, "codex" | "claude" | "default"> = {};
+
+  for (const [assignee, agent] of Object.entries(value)) {
+    if (agent !== "codex" && agent !== "claude" && agent !== "default") {
+      throw new Error(
+        `AGSC config field "assignee_tags.${assignee}" must be "codex", "claude", or "default".`,
+      );
+    }
+
+    assigneeTags[assignee] = agent;
+  }
+
+  return assigneeTags;
 }
 
 function requiredString(value: unknown, fieldName: string): string {

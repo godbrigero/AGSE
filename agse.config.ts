@@ -9,6 +9,9 @@ const config: AGSCWorkspaceConfig = {
     claude: "agse-claude",
     default: "agse",
   },
+  assignee_tags: {
+    godbrigero: "codex",
+  },
   restrict_user_to_local_only: true,
 };
 
