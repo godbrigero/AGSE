@@ -175,12 +175,7 @@ Run tests:
 npm test
 ```
 
-Run full local verification:
-
-```sh
-npm run typecheck
-npm test
-```
+For full local verification, run both type checking and tests.
 
 Run Codex diagnostics:
 
