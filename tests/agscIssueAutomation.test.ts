@@ -477,6 +477,78 @@ test("Codex recoverable steer errors are treated as fallback conditions", () => 
   );
 });
 
+test("Codex missing thread errors are recognized narrowly", () => {
+  assert.equal(
+    automation.isMissingCodexThreadError(
+      new Error("thread not found: 019f1816-2e85-7ee3-b3cd-c79a730396b7"),
+    ),
+    true,
+  );
+  assert.equal(
+    automation.isMissingCodexThreadError(new Error("permission denied")),
+    false,
+  );
+});
+
+test("Codex thread availability distinguishes active archived and missing threads", async () => {
+  const calls: Array<Record<string, unknown>> = [];
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => ({
+      async listChats(params: Record<string, unknown>) {
+        calls.push(params);
+
+        if (params.archived) {
+          return { data: [{ id: "archived-thread" }] };
+        }
+
+        return { data: [{ id: "active-thread" }] };
+      },
+      close() {},
+    }) as never,
+  );
+
+  try {
+    assert.equal(
+      await automation.findCodexThreadAvailability("/repo", "active-thread"),
+      "active",
+    );
+    assert.equal(
+      await automation.findCodexThreadAvailability("/repo", "archived-thread"),
+      "archived",
+    );
+    assert.equal(
+      await automation.findCodexThreadAvailability("/repo", "missing-thread"),
+      "missing",
+    );
+    assert.deepEqual(
+      calls.map((call) => call.archived),
+      [false, false, true, false, true],
+    );
+  } finally {
+    restoreFactory();
+  }
+});
+
+test("Codex thread availability is unknown when validation fails", async () => {
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => ({
+      async listChats() {
+        throw new Error("daemon unavailable");
+      },
+      close() {},
+    }) as never,
+  );
+
+  try {
+    assert.equal(
+      await automation.findCodexThreadAvailability("/repo", "thread-1"),
+      "unknown",
+    );
+  } finally {
+    restoreFactory();
+  }
+});
+
 test("Codex turn ids can be read from completion notifications", () => {
   assert.equal(
     automation.extractNotificationTurnId({
