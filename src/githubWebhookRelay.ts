@@ -10,6 +10,7 @@ export const DEFAULT_GITHUB_WEBHOOK_RELAY_EVENTS = [
   "issue_comment",
   "pull_request",
   "pull_request_review",
+  "pull_request_review_comment",
 ] as const;
 
 export type GitHubWebhookRelayEvent = {

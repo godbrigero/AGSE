@@ -18,6 +18,8 @@ import type {
   GitHubIssue,
   GitHubIssueComment,
   GitHubPullRequest,
+  GitHubPullRequestReview,
+  GitHubPullRequestReviewComment,
   GitHubRepositoryRef,
 } from "../src/githubApi.ts";
 import type { CodexWorkflows } from "../src/codexIntegration/index.ts";
@@ -306,19 +308,92 @@ test("PR comments are routed into the existing active Codex turn once per event"
       github as never,
     );
 
-    assert.deepEqual(codex.steeredMessages, [
-      {
-        threadId: "thread-1",
-        expectedTurnId: "impl-turn-1",
-        input: "please add one more workflow assertion",
-      },
-    ]);
+    assert.equal(codex.steeredMessages.length, 1);
+    assert.equal(codex.steeredMessages[0]?.threadId, "thread-1");
+    assert.equal(codex.steeredMessages[0]?.expectedTurnId, "impl-turn-1");
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /please add one more workflow assertion/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /a response to each new comment is required/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /Code changes for ordinary PR comments are optional/,
+    );
     assert.deepEqual(github.commentReactions, [
       { commentId: 501, content: "eyes" },
     ]);
 
     const state = await new AGSCStateStore(fixture.project.rootPath).read();
     assert.deepEqual(state.workflows[0]?.syncedPrEventIds, ["comment:501"]);
+
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+    assert.equal(codex.steeredMessages.length, 1);
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
+test("PR review comments are routed into the existing active Codex turn once per event", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+    await waitFor(async () =>
+      Boolean(github.pullRequest?.body?.includes("## Codex Plan")),
+    );
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    github.addReviewComment("please fix this review finding");
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.equal(codex.steeredMessages.length, 1);
+    assert.equal(codex.steeredMessages[0]?.threadId, "thread-1");
+    assert.equal(codex.steeredMessages[0]?.expectedTurnId, "impl-turn-1");
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /please fix this review finding/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /making the requested code changes is required/,
+    );
+    assert.deepEqual(github.reviewCommentReactions, [
+      { commentId: 601, content: "eyes" },
+    ]);
+
+    const state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.deepEqual(state.workflows[0]?.syncedPrEventIds, [
+      "review-comment:601",
+    ]);
 
     await syncTrackedPullRequests(
       fixture.project,
@@ -1060,7 +1135,10 @@ class FakeGitHub {
   issue: GitHubIssue;
   pullRequest: GitHubPullRequest | undefined;
   comments: GitHubIssueComment[] = [];
+  reviews: GitHubPullRequestReview[] = [];
+  reviewComments: GitHubPullRequestReviewComment[] = [];
   commentReactions: Array<{ commentId: number; content: string }> = [];
+  reviewCommentReactions: Array<{ commentId: number; content: string }> = [];
   issueReactions: Array<{ issueNumber: number; content: string }> = [];
   failNextReaction = false;
   failNextIssueReaction = false;
@@ -1144,8 +1222,12 @@ class FakeGitHub {
     return this.comments;
   }
 
-  async listPullRequestReviews(): Promise<[]> {
-    return [];
+  async listPullRequestReviews(): Promise<GitHubPullRequestReview[]> {
+    return this.reviews;
+  }
+
+  async listPullRequestReviewComments(): Promise<GitHubPullRequestReviewComment[]> {
+    return this.reviewComments;
   }
 
   async addIssueComment(): Promise<GitHubIssueComment> {
@@ -1174,6 +1256,14 @@ class FakeGitHub {
     this.commentReactions.push({ commentId, content });
   }
 
+  async addPullRequestReviewCommentReaction(
+    _repository: GitHubRepositoryRef,
+    commentId: number,
+    content: string,
+  ): Promise<void> {
+    this.reviewCommentReactions.push({ commentId, content });
+  }
+
   async addIssueReaction(
     _repository: GitHubRepositoryRef,
     issueNumber: number,
@@ -1194,6 +1284,24 @@ class FakeGitHub {
       html_url: "https://github.com/example/agse/pull/7#issuecomment-501",
       created_at: "2026-06-26T00:00:03Z",
       updated_at: "2026-06-26T00:00:03Z",
+      user: { login: "reviewer" },
+    });
+    assert.ok(this.pullRequest);
+    this.pullRequest = {
+      ...this.pullRequest,
+      updated_at: "2026-06-26T00:00:03Z",
+    };
+  }
+
+  addReviewComment(body: string): void {
+    this.reviewComments.push({
+      id: 601,
+      body,
+      html_url: "https://github.com/example/agse/pull/7#discussion_r601",
+      created_at: "2026-06-26T00:00:03Z",
+      updated_at: "2026-06-26T00:00:03Z",
+      path: "src/agscIssueAutomation.ts",
+      line: 42,
       user: { login: "reviewer" },
     });
     assert.ok(this.pullRequest);
@@ -1293,9 +1401,7 @@ class FakeCodex {
     this.steeredMessages.push({
       threadId,
       expectedTurnId: params.expectedTurnId,
-      input: input.includes("please add one more workflow assertion")
-        ? "please add one more workflow assertion"
-        : input,
+      input,
     });
   }
 

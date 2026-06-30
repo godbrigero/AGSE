@@ -61,6 +61,18 @@ export type GitHubPullRequestReview = {
   user?: GitHubUser;
 };
 
+export type GitHubPullRequestReviewComment = {
+  id: number;
+  body: string | null;
+  html_url: string;
+  created_at: string;
+  updated_at: string;
+  path?: string | null;
+  line?: number | null;
+  original_line?: number | null;
+  user?: GitHubUser;
+};
+
 export type GitHubReactionContent = "eyes";
 
 export type GitHubRepositoryHook = {
@@ -248,6 +260,23 @@ export class GitHubApiClient {
     );
   }
 
+  async addPullRequestReviewCommentReaction(
+    repository: GitHubRepositoryRef,
+    commentId: number,
+    content: GitHubReactionContent,
+  ): Promise<void> {
+    await this.request<void>(
+      this.repoUrl(repository, `pulls/comments/${commentId}/reactions`),
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+        },
+        body: JSON.stringify({ content }),
+      },
+    );
+  }
+
   async addIssueReaction(
     repository: GitHubRepositoryRef,
     issueNumber: number,
@@ -305,6 +334,15 @@ export class GitHubApiClient {
   ): Promise<GitHubPullRequestReview[]> {
     return this.request<GitHubPullRequestReview[]>(
       this.repoUrl(repository, `pulls/${pullNumber}/reviews`),
+    );
+  }
+
+  async listPullRequestReviewComments(
+    repository: GitHubRepositoryRef,
+    pullNumber: number,
+  ): Promise<GitHubPullRequestReviewComment[]> {
+    return this.request<GitHubPullRequestReviewComment[]>(
+      this.repoUrl(repository, `pulls/${pullNumber}/comments`),
     );
   }
 
