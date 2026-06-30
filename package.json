@@ -10,6 +10,8 @@
     "start": "node --experimental-strip-types src/main.ts",
     "dev": "node --watch --experimental-strip-types src/main.ts",
     "diagnostics:codex": "node --experimental-strip-types scripts/codexDiagnostic.ts",
+    "link:initialize-agse": "npm link --workspace initialize-agse",
+    "publish:initialize-agse": "npm publish --workspace initialize-agse --access public",
     "test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
     "test:watch": "node --test --watch --experimental-strip-types \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit"

@@ -31,7 +31,9 @@ The app entrypoint is `src/main.ts`. This project intentionally does not compile
 
 ## AGSC project discovery
 
-AGSC projects are folders that contain an `agse.config.ts` marker file. Create or replace that file in the current folder with:
+AGSC projects are folders that contain an `agse.config.ts` marker file.
+
+After the initializer package has been published to npm, create or replace that file in the current folder with:
 
 ```sh
 npx initialize-agse@latest .
@@ -42,6 +44,22 @@ Or install it into another repo folder:
 ```sh
 npx initialize-agse@latest path/to/repo
 ```
+
+For local development before publishing, link the workspace package globally:
+
+```sh
+npm run link:initialize-agse
+initialize-agse path/to/repo
+```
+
+Publish the initializer package with:
+
+```sh
+npm login
+npm run publish:initialize-agse
+```
+
+The `npx initialize-agse@latest` command only works after `initialize-agse` exists on the npm registry.
 
 The initializer overwrites any existing `agse.config.ts` in the target folder. It writes a self-contained typed config object:
 
