@@ -228,6 +228,23 @@ export class GitHubApiClient {
     );
   }
 
+  async addIssueReaction(
+    repository: GitHubRepositoryRef,
+    issueNumber: number,
+    content: GitHubReactionContent,
+  ): Promise<void> {
+    await this.request<void>(
+      this.repoUrl(repository, `issues/${issueNumber}/reactions`),
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+        },
+        body: JSON.stringify({ content }),
+      },
+    );
+  }
+
   async closePullRequest(
     repository: GitHubRepositoryRef,
     pullNumber: number,
