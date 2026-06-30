@@ -408,6 +408,68 @@ test("PR review comments are routed into the existing active Codex turn once per
   }
 });
 
+test("PR review bodies are routed as required-change feedback", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+    await waitFor(async () =>
+      Boolean(github.pullRequest?.body?.includes("## Codex Plan")),
+    );
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    github.addReview("please fix the failing review workflow");
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.equal(codex.steeredMessages.length, 1);
+    assert.equal(codex.steeredMessages[0]?.threadId, "thread-1");
+    assert.equal(codex.steeredMessages[0]?.expectedTurnId, "impl-turn-1");
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /please fix the failing review workflow/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /making the requested code changes is required/,
+    );
+    assert.deepEqual(github.commentReactions, []);
+    assert.deepEqual(github.reviewCommentReactions, []);
+
+    const state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.deepEqual(state.workflows[0]?.syncedPrEventIds, ["review:701"]);
+
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+    assert.equal(codex.steeredMessages.length, 1);
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
 test("PR comments are retried when eyes reaction fails", async () => {
   const fixture = await createGitFixture();
   const github = new FakeGitHub(issue());
@@ -1547,6 +1609,22 @@ class FakeGitHub {
       updated_at: "2026-06-26T00:00:03Z",
       path: "src/agscIssueAutomation.ts",
       line: 42,
+      user: { login: "reviewer" },
+    });
+    assert.ok(this.pullRequest);
+    this.pullRequest = {
+      ...this.pullRequest,
+      updated_at: "2026-06-26T00:00:03Z",
+    };
+  }
+
+  addReview(body: string): void {
+    this.reviews.push({
+      id: 701,
+      body,
+      html_url: "https://github.com/example/agse/pull/7#pullrequestreview-701",
+      submitted_at: "2026-06-26T00:00:03Z",
+      state: "CHANGES_REQUESTED",
       user: { login: "reviewer" },
     });
     assert.ok(this.pullRequest);

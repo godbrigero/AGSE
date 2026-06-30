@@ -412,6 +412,17 @@ test("PR event helpers format events, merge ids, and ignore AGSC marker comments
     }),
     /Review comment by godbrigero at 2026-06-25T04:20:00Z on src\/app\.ts:12:\nplease handle the edge case/,
   );
+  assert.match(
+    automation.formatPullRequestReview({
+      id: 2,
+      body: "please make the requested changes",
+      html_url: "https://github.com/example/repo/pull/7#pullrequestreview-2",
+      submitted_at: "2026-06-25T04:21:00Z",
+      state: "CHANGES_REQUESTED",
+      user: { login: "godbrigero" },
+    }),
+    /Review CHANGES_REQUESTED by godbrigero at 2026-06-25T04:21:00Z:\nplease make the requested changes/,
+  );
 });
 
 test("extractTurnStatus finds nested Codex turn status", () => {
