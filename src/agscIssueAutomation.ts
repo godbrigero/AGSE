@@ -2282,7 +2282,11 @@ async function notifyAgentAboutPullRequestUpdate(
     keepCodexOpen = true;
 
     return {
+      codexImplementationTurnId: followUp.turnId,
       codexActiveTurnId: followUp.turnId,
+      codexImplementationStartedAt: new Date().toISOString(),
+      codexImplementationCompletedAt: undefined,
+      codexImplementationCommentedAt: undefined,
       agentHandoffPhase: "implementing",
     };
   } finally {
@@ -2335,6 +2339,8 @@ async function syncCodexImplementationStatus(
       });
       const nextWorkflow: AGSCTrackedWorkflow = {
         ...workflow,
+        codexImplementationTurnId:
+          recovery.turnId ?? workflow.codexImplementationTurnId,
         codexActiveTurnId: recovery.turnId,
         agentHandoffPhase: recovery.turnId ? "implementing" : "idle",
       };
@@ -2381,6 +2387,8 @@ async function syncCodexImplementationStatus(
       });
       const nextWorkflow: AGSCTrackedWorkflow = {
         ...workflow,
+        codexImplementationTurnId:
+          recovery.turnId ?? workflow.codexImplementationTurnId,
         codexActiveTurnId: recovery.turnId,
         agentHandoffPhase: recovery.turnId ? "implementing" : "idle",
       };
@@ -2401,6 +2409,8 @@ async function syncCodexImplementationStatus(
 
     let nextWorkflow: AGSCTrackedWorkflow = {
       ...workflow,
+      codexImplementationTurnId:
+        workflow.codexActiveTurnId ?? workflow.codexImplementationTurnId,
       codexActiveTurnId: undefined,
       codexImplementationCompletedAt:
         workflow.codexImplementationCompletedAt ?? new Date().toISOString(),
@@ -2797,12 +2807,15 @@ function extractProposedPlan(response: string): string {
 function buildImplementationCompleteComment(
   workflow: AGSCTrackedWorkflow,
 ): string {
+  const implementationTurnId =
+    workflow.codexActiveTurnId ?? workflow.codexImplementationTurnId ?? "unknown";
+
   return [
     AGSC_IMPLEMENTATION_DONE_MARKER,
     `AGSC completed the Codex implementation pass for issue #${workflow.issueNumber}.`,
     "",
     `Codex thread: ${workflow.codexThreadId ?? "unknown"}`,
-    `Implementation turn: ${workflow.codexImplementationTurnId ?? "unknown"}`,
+    `Implementation turn: ${implementationTurnId}`,
   ].join("\n");
 }
 

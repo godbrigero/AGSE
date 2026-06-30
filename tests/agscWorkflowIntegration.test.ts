@@ -904,6 +904,100 @@ test("completed detached implementation posts a PR comment and clears active tur
   }
 });
 
+test("completed feedback pass posts a fresh PR comment after prior implementation comment", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  codex.detachedTurnIds = ["impl-turn-1", "feedback-turn-1"];
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    const stateBeforeInitialCompletion = await new AGSCStateStore(
+      fixture.project.rootPath,
+    ).read();
+    const initialWorkflow = stateBeforeInitialCompletion.workflows[0];
+    assert.ok(initialWorkflow);
+    await writeFile(
+      join(initialWorkflow.worktreePath, "codex-result.txt"),
+      "implemented\n",
+      "utf8",
+    );
+
+    codex.turnStatus = "completed";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.equal(github.comments.length, 1);
+    assert.match(github.comments[0]?.body ?? "", /Implementation turn: impl-turn-1/);
+
+    github.addHumanComment("please add one more workflow assertion");
+    codex.turnStatus = "inProgress";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    let state = await new AGSCStateStore(fixture.project.rootPath).read();
+    const feedbackWorkflow = state.workflows[0];
+    assert.equal(feedbackWorkflow?.codexActiveTurnId, "feedback-turn-1");
+    assert.equal(feedbackWorkflow?.codexImplementationTurnId, "feedback-turn-1");
+    assert.equal(feedbackWorkflow?.codexImplementationCommentedAt, undefined);
+    assert.deepEqual(github.commentReactions, [
+      { commentId: 501, content: "eyes" },
+    ]);
+
+    assert.ok(feedbackWorkflow);
+    await writeFile(
+      join(feedbackWorkflow.worktreePath, "feedback-result.txt"),
+      "addressed feedback\n",
+      "utf8",
+    );
+    codex.turnStatus = "completed";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    const agscComments = github.comments.filter((comment) =>
+      automation.isAGSCComment(comment.body),
+    );
+    assert.equal(agscComments.length, 2);
+    assert.match(
+      agscComments[1]?.body ?? "",
+      /Implementation turn: feedback-turn-1/,
+    );
+
+    state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.equal(state.workflows[0]?.codexActiveTurnId, undefined);
+    assert.equal(state.workflows[0]?.agentHandoffPhase, "idle");
+    assert.equal(typeof state.workflows[0]?.codexImplementationCommentedAt, "string");
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
 test("interrupted detached implementation starts one recovery turn", async () => {
   const fixture = await createGitFixture();
   const github = new FakeGitHub(issue());
@@ -1148,10 +1242,14 @@ class FakeGitHub {
     return [];
   }
 
-  async addIssueComment(): Promise<GitHubIssueComment> {
+  async addIssueComment(
+    _repository: GitHubRepositoryRef,
+    _issueNumber: number,
+    body: string,
+  ): Promise<GitHubIssueComment> {
     const comment: GitHubIssueComment = {
-      id: 9001,
-      body: "<!-- agsc:implementation-complete -->\ndone",
+      id: 9000 + this.comments.length + 1,
+      body,
       html_url: "https://github.com/example/agse/pull/7#issuecomment-9001",
       created_at: "2026-06-26T00:00:04Z",
       updated_at: "2026-06-26T00:00:04Z",
@@ -1213,6 +1311,7 @@ class FakeCodex {
   messages: string[] = [];
   detachedMessages: string[] = [];
   detachedTurnIds = ["impl-turn-1"];
+  detachedStartedTurnIds: string[] = [];
   turnStatus = "inProgress";
   closeCount = 0;
   onStartChat?: () => void;
@@ -1258,6 +1357,7 @@ class FakeCodex {
     const turnId =
       this.detachedTurnIds.shift() ??
       `detached-turn-${this.detachedMessages.length}`;
+    this.detachedStartedTurnIds.push(turnId);
     return {
       threadId: "thread-1",
       turnId,
@@ -1275,7 +1375,10 @@ class FakeCodex {
       raw: {
         thread: {
           id: "thread-1",
-          turns: [{ id: "impl-turn-1", status: this.turnStatus }],
+          turns: this.detachedStartedTurnIds.map((id) => ({
+            id,
+            status: this.turnStatus,
+          })),
         },
       },
     };
