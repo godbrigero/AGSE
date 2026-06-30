@@ -462,6 +462,153 @@ test("PR comments are retried when eyes reaction fails", async () => {
   }
 });
 
+test("archived Codex PR thread is unarchived and reused for PR comments", async () => {
+  automation.closeAllCodexHandoffs();
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const registeredCodexRoots: Array<Record<string, unknown>> = [];
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(
+    async (input) => {
+      registeredCodexRoots.push(input);
+    },
+  );
+
+  try {
+    github.pullRequest = pullRequestForIssue(github.issue);
+    codex.archivedThreadIds.add("thread-1");
+    codex.detachedStartedTurnIds.push("impl-turn-1");
+    await new AGSCStateStore(fixture.project.rootPath).upsertWorkflow({
+      issueId: github.issue.id,
+      issueNumber: github.issue.number,
+      issueTitle: github.issue.title,
+      issueUrl: github.issue.html_url,
+      agent: "codex",
+      worktreePath: automation.buildIssueWorktreePath(
+        fixture.project.rootPath,
+        github.issue,
+      ),
+      branchName: automation.buildIssueBranchName(github.issue),
+      pullNumber: 7,
+      pullUrl: "https://github.com/example/agse/pull/7",
+      pullState: "open",
+      codexThreadId: "thread-1",
+      codexImplementationTurnId: "impl-turn-1",
+      codexActiveTurnId: "impl-turn-1",
+      agentHandoffVersion: automation.CODEX_HANDOFF_PROMPT_VERSION,
+      agentHandoffPhase: "implementing",
+      lastPullUpdatedAt: github.pullRequest.updated_at,
+    });
+
+    github.addHumanComment("please add one more workflow assertion");
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.deepEqual(codex.unarchivedThreads, ["thread-1"]);
+    assert.equal(codex.steeredMessages.length, 1);
+    assert.equal(codex.steeredMessages[0]?.threadId, "thread-1");
+    assert.equal(codex.steeredMessages[0]?.expectedTurnId, "impl-turn-1");
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /please add one more workflow assertion/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /a response to each new comment is required/,
+    );
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /Code changes for ordinary PR comments are optional/,
+    );
+    assert.deepEqual(github.commentReactions, [
+      { commentId: 501, content: "eyes" },
+    ]);
+    assert.equal(codex.startedChats.length, 0);
+    assert.deepEqual(registeredCodexRoots, [
+      {
+        rootPath: automation.buildIssueWorktreePath(
+          fixture.project.rootPath,
+          github.issue,
+        ),
+        parentRootPath: fixture.project.rootPath,
+        label: "Issue #42: Test AGSE workflow",
+        threadId: "thread-1",
+      },
+    ]);
+
+    const state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.deepEqual(state.workflows[0]?.syncedPrEventIds, ["comment:501"]);
+    assert.equal(state.workflows[0]?.codexThreadId, "thread-1");
+  } finally {
+    automation.closeAllCodexHandoffs();
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
+test("missing Codex PR thread restarts without acknowledging PR comments", async () => {
+  automation.closeAllCodexHandoffs();
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    github.pullRequest = pullRequestForIssue(github.issue);
+    codex.knownThreadIds.delete("missing-thread");
+    await new AGSCStateStore(fixture.project.rootPath).upsertWorkflow({
+      issueId: github.issue.id,
+      issueNumber: github.issue.number,
+      issueTitle: github.issue.title,
+      issueUrl: github.issue.html_url,
+      agent: "codex",
+      worktreePath: automation.buildIssueWorktreePath(
+        fixture.project.rootPath,
+        github.issue,
+      ),
+      branchName: automation.buildIssueBranchName(github.issue),
+      pullNumber: 7,
+      pullUrl: "https://github.com/example/agse/pull/7",
+      pullState: "open",
+      codexThreadId: "missing-thread",
+      codexImplementationTurnId: "impl-turn-1",
+      codexActiveTurnId: "impl-turn-1",
+      agentHandoffVersion: automation.CODEX_HANDOFF_PROMPT_VERSION,
+      agentHandoffPhase: "implementing",
+      lastPullUpdatedAt: github.pullRequest.updated_at,
+    });
+
+    github.addHumanComment("please add one more workflow assertion");
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.equal(codex.startedChats.length, 1);
+    assert.deepEqual(codex.steeredMessages, []);
+    assert.deepEqual(github.commentReactions, []);
+
+    const state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.equal(state.workflows[0]?.syncedPrEventIds, undefined);
+  } finally {
+    automation.closeAllCodexHandoffs();
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
 test("legacy AGSC worktrees are moved to the Codex worktree root", async () => {
   const fixture = await createGitFixture();
   const github = new FakeGitHub(issue());
@@ -979,6 +1126,100 @@ test("completed detached implementation posts a PR comment and clears active tur
   }
 });
 
+test("completed feedback pass posts a fresh PR comment after prior implementation comment", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  codex.detachedTurnIds = ["impl-turn-1", "feedback-turn-1"];
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    const stateBeforeInitialCompletion = await new AGSCStateStore(
+      fixture.project.rootPath,
+    ).read();
+    const initialWorkflow = stateBeforeInitialCompletion.workflows[0];
+    assert.ok(initialWorkflow);
+    await writeFile(
+      join(initialWorkflow.worktreePath, "codex-result.txt"),
+      "implemented\n",
+      "utf8",
+    );
+
+    codex.turnStatus = "completed";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    assert.equal(github.comments.length, 1);
+    assert.match(github.comments[0]?.body ?? "", /Implementation turn: impl-turn-1/);
+
+    github.addHumanComment("please add one more workflow assertion");
+    codex.turnStatus = "inProgress";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    let state = await new AGSCStateStore(fixture.project.rootPath).read();
+    const feedbackWorkflow = state.workflows[0];
+    assert.equal(feedbackWorkflow?.codexActiveTurnId, "feedback-turn-1");
+    assert.equal(feedbackWorkflow?.codexImplementationTurnId, "feedback-turn-1");
+    assert.equal(feedbackWorkflow?.codexImplementationCommentedAt, undefined);
+    assert.deepEqual(github.commentReactions, [
+      { commentId: 501, content: "eyes" },
+    ]);
+
+    assert.ok(feedbackWorkflow);
+    await writeFile(
+      join(feedbackWorkflow.worktreePath, "feedback-result.txt"),
+      "addressed feedback\n",
+      "utf8",
+    );
+    codex.turnStatus = "completed";
+    await syncTrackedPullRequests(
+      fixture.project,
+      repository,
+      github as never,
+    );
+
+    const agscComments = github.comments.filter((comment) =>
+      automation.isAGSCComment(comment.body),
+    );
+    assert.equal(agscComments.length, 2);
+    assert.match(
+      agscComments[1]?.body ?? "",
+      /Implementation turn: feedback-turn-1/,
+    );
+
+    state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.equal(state.workflows[0]?.codexActiveTurnId, undefined);
+    assert.equal(state.workflows[0]?.agentHandoffPhase, "idle");
+    assert.equal(typeof state.workflows[0]?.codexImplementationCommentedAt, "string");
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
 test("interrupted detached implementation starts one recovery turn", async () => {
   const fixture = await createGitFixture();
   const github = new FakeGitHub(issue());
@@ -1230,10 +1471,14 @@ class FakeGitHub {
     return this.reviewComments;
   }
 
-  async addIssueComment(): Promise<GitHubIssueComment> {
+  async addIssueComment(
+    _repository: GitHubRepositoryRef,
+    _issueNumber: number,
+    body: string,
+  ): Promise<GitHubIssueComment> {
     const comment: GitHubIssueComment = {
-      id: 9001,
-      body: "<!-- agsc:implementation-complete -->\ndone",
+      id: 9000 + this.comments.length + 1,
+      body,
       html_url: "https://github.com/example/agse/pull/7#issuecomment-9001",
       created_at: "2026-06-26T00:00:04Z",
       updated_at: "2026-06-26T00:00:04Z",
@@ -1313,6 +1558,9 @@ class FakeGitHub {
 }
 
 class FakeCodex {
+  knownThreadIds = new Set(["thread-1"]);
+  archivedThreadIds = new Set<string>();
+  unarchivedThreads: string[] = [];
   rootPaths: string[] = [];
   startedChats: Array<Record<string, unknown>> = [];
   renamedThreads: Array<{ threadId: string; title: string }> = [];
@@ -1321,6 +1569,7 @@ class FakeCodex {
   messages: string[] = [];
   detachedMessages: string[] = [];
   detachedTurnIds = ["impl-turn-1"];
+  detachedStartedTurnIds: string[] = [];
   turnStatus = "inProgress";
   closeCount = 0;
   onStartChat?: () => void;
@@ -1333,6 +1582,8 @@ class FakeCodex {
   async startChat(input: Record<string, unknown>) {
     this.onStartChat?.();
     this.startedChats.push(input);
+    this.knownThreadIds.add("thread-1");
+    this.archivedThreadIds.delete("thread-1");
     return { id: "thread-1", raw: { thread: { id: "thread-1" } } };
   }
 
@@ -1366,6 +1617,7 @@ class FakeCodex {
     const turnId =
       this.detachedTurnIds.shift() ??
       `detached-turn-${this.detachedMessages.length}`;
+    this.detachedStartedTurnIds.push(turnId);
     return {
       threadId: "thread-1",
       turnId,
@@ -1373,8 +1625,14 @@ class FakeCodex {
     };
   }
 
-  async listChats() {
-    return { data: [{ id: "thread-1" }] };
+  async listChats(params: { archived?: boolean } = {}) {
+    const ids = [...this.knownThreadIds].filter((threadId) =>
+      params.archived
+        ? this.archivedThreadIds.has(threadId)
+        : !this.archivedThreadIds.has(threadId)
+    );
+
+    return { data: ids.map((id) => ({ id })) };
   }
 
   async readChat() {
@@ -1383,14 +1641,21 @@ class FakeCodex {
       raw: {
         thread: {
           id: "thread-1",
-          turns: [{ id: "impl-turn-1", status: this.turnStatus }],
+          turns: this.detachedStartedTurnIds.map((id) => ({
+            id,
+            status: this.turnStatus,
+          })),
         },
       },
     };
   }
 
-  async resumeChat() {
-    return { id: "thread-1", raw: {} };
+  async resumeChat(threadId = "thread-1") {
+    if (!this.knownThreadIds.has(threadId) || this.archivedThreadIds.has(threadId)) {
+      throw new Error(`thread not found: ${threadId}`);
+    }
+
+    return { id: threadId, raw: {} };
   }
 
   async steerMessage(
@@ -1398,6 +1663,10 @@ class FakeCodex {
     input: string,
     params: { expectedTurnId: string },
   ) {
+    if (!this.knownThreadIds.has(threadId) || this.archivedThreadIds.has(threadId)) {
+      throw new Error(`thread not found: ${threadId}`);
+    }
+
     this.steeredMessages.push({
       threadId,
       expectedTurnId: params.expectedTurnId,
@@ -1407,10 +1676,22 @@ class FakeCodex {
 
   async archiveChat(threadId: string) {
     this.archivedThreads.push(threadId);
+    this.archivedThreadIds.add(threadId);
   }
 
   async deleteChat(threadId: string) {
     this.deletedThreads.push(threadId);
+    this.knownThreadIds.delete(threadId);
+    this.archivedThreadIds.delete(threadId);
+  }
+
+  async unarchiveChat(threadId: string) {
+    if (!this.knownThreadIds.has(threadId)) {
+      throw new Error(`thread not found: ${threadId}`);
+    }
+
+    this.unarchivedThreads.push(threadId);
+    this.archivedThreadIds.delete(threadId);
   }
 
   close() {
