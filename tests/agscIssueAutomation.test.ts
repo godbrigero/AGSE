@@ -330,19 +330,49 @@ test("Codex continuation message instructs the same thread to finish commit and 
   assert.match(message, /Only stop when the worktree is clean/);
 });
 
-test("Codex PR update message sends reviewer feedback as a normal follow-up", () => {
+test("Codex PR update message makes ordinary comments response-required and changes optional", () => {
   const message = automation.buildCodexPullRequestUpdateMessage(
-    [
-      "Comment by godbrigero at 2026-06-25T04:19:00Z:",
-      "this is not enough add 5 more tests",
-      "https://github.com/example/repo/pull/7#issuecomment-1",
-    ].join("\n"),
+    {
+      summary: [
+        "Comment by godbrigero at 2026-06-25T04:19:00Z:",
+        "can you clarify why this path is safe?",
+        "https://github.com/example/repo/pull/7#issuecomment-1",
+      ].join("\n"),
+      eventIds: ["comment:1"],
+      issueCommentIds: [1],
+      reviewCommentIds: [],
+      hasResponseRequiredComments: true,
+      hasRequiredReviewChanges: false,
+    },
   );
 
   assert.match(message, /A tracked GitHub PR changed/);
-  assert.match(message, /Do not only acknowledge the feedback/);
+  assert.match(message, /a response to each new comment is required/);
+  assert.match(message, /Code changes for ordinary PR comments are optional/);
+  assert.match(message, /can you clarify why this path is safe/);
+  assert.doesNotMatch(message, /making the requested code changes is required/);
+});
+
+test("Codex PR update message requires changes for review feedback", () => {
+  const message = automation.buildCodexPullRequestUpdateMessage(
+    {
+      summary: [
+        "Review comment by godbrigero at 2026-06-25T04:19:00Z on src/app.ts:12:",
+        "please add a regression test here",
+        "https://github.com/example/repo/pull/7#discussion_r1",
+      ].join("\n"),
+      eventIds: ["review-comment:1"],
+      issueCommentIds: [],
+      reviewCommentIds: [1],
+      hasResponseRequiredComments: false,
+      hasRequiredReviewChanges: true,
+    },
+  );
+
+  assert.match(message, /making the requested code changes is required/);
+  assert.match(message, /run focused verification/);
   assert.match(message, /AGSC will commit and push them/);
-  assert.match(message, /this is not enough add 5 more tests/);
+  assert.match(message, /please add a regression test here/);
 });
 
 test("PR event helpers format events, merge ids, and ignore AGSC marker comments", () => {
@@ -352,8 +382,11 @@ test("PR event helpers format events, merge ids, and ignore AGSC marker comments
   );
   assert.equal(automation.isAGSCComment("human feedback"), false);
   assert.deepEqual(
-    automation.mergeSyncedEventIds(["comment:1"], ["comment:1", "review:2"]),
-    ["comment:1", "review:2"],
+    automation.mergeSyncedEventIds(
+      ["comment:1"],
+      ["comment:1", "review:2", "review-comment:3"],
+    ),
+    ["comment:1", "review:2", "review-comment:3"],
   );
   assert.match(
     automation.formatPullRequestComment({
@@ -365,6 +398,30 @@ test("PR event helpers format events, merge ids, and ignore AGSC marker comments
       user: { login: "godbrigero" },
     }),
     /Comment by godbrigero at 2026-06-25T04:20:00Z:\nplease add a test/,
+  );
+  assert.match(
+    automation.formatPullRequestReviewComment({
+      id: 3,
+      body: "please handle the edge case",
+      html_url: "https://github.com/example/repo/pull/7#discussion_r3",
+      created_at: "2026-06-25T04:19:00Z",
+      updated_at: "2026-06-25T04:20:00Z",
+      path: "src/app.ts",
+      line: 12,
+      user: { login: "godbrigero" },
+    }),
+    /Review comment by godbrigero at 2026-06-25T04:20:00Z on src\/app\.ts:12:\nplease handle the edge case/,
+  );
+  assert.match(
+    automation.formatPullRequestReview({
+      id: 2,
+      body: "please make the requested changes",
+      html_url: "https://github.com/example/repo/pull/7#pullrequestreview-2",
+      submitted_at: "2026-06-25T04:21:00Z",
+      state: "CHANGES_REQUESTED",
+      user: { login: "godbrigero" },
+    }),
+    /Review CHANGES_REQUESTED by godbrigero at 2026-06-25T04:21:00Z:\nplease make the requested changes/,
   );
 });
 

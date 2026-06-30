@@ -76,6 +76,37 @@ test("GitHubApiClient deletes repository hooks", async () => {
   assert.equal(calls[0]?.method, "DELETE");
 });
 
+test("GitHubApiClient lists pull request review comments", async () => {
+  const calls = await withMockFetch(async () => {
+    const github = new GitHubApiClient("token-1");
+    await github.listPullRequestReviewComments({ owner: "org", repo: "repo" }, 7);
+  });
+
+  assert.equal(
+    calls[0]?.url,
+    "https://api.github.com/repos/org/repo/pulls/7/comments",
+  );
+  assert.equal(calls[0]?.method, "GET");
+});
+
+test("GitHubApiClient reacts to pull request review comments", async () => {
+  const calls = await withMockFetch(async () => {
+    const github = new GitHubApiClient("token-1");
+    await github.addPullRequestReviewCommentReaction(
+      { owner: "org", repo: "repo" },
+      501,
+      "eyes",
+    );
+  });
+
+  assert.equal(
+    calls[0]?.url,
+    "https://api.github.com/repos/org/repo/pulls/comments/501/reactions",
+  );
+  assert.equal(calls[0]?.method, "POST");
+  assert.deepEqual(JSON.parse(calls[0]?.body ?? ""), { content: "eyes" });
+});
+
 type FetchCall = {
   url: string;
   method: string;

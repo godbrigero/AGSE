@@ -31,6 +31,7 @@ import {
   type GitHubIssueComment,
   type GitHubPullRequest,
   type GitHubPullRequestReview,
+  type GitHubPullRequestReviewComment,
   type GitHubRepositoryRef,
 } from "./githubApi.ts";
 import { info, style, success, warning } from "./terminalStyle.ts";
@@ -108,7 +109,10 @@ type AGSCPullRequestMetadata = {
 type PullRequestEventSummary = {
   summary: string;
   eventIds: string[];
-  commentIds: number[];
+  issueCommentIds: number[];
+  reviewCommentIds: number[];
+  hasResponseRequiredComments: boolean;
+  hasRequiredReviewChanges: boolean;
 };
 
 export async function handleGitHubIssueForProject({
@@ -344,12 +348,12 @@ export async function syncTrackedPullRequests(
       const notificationResult = await notifyAgentAboutPullRequestUpdate(
         project,
         workflowAfterCodexSync,
-        eventSummary.summary,
+        eventSummary,
       );
-      await acknowledgePullRequestCommentEvents(
+      await acknowledgePullRequestFeedbackEvents(
         github,
         repository,
-        eventSummary.commentIds,
+        eventSummary,
       );
       await stateStore.upsertWorkflow({
         ...workflowAfterCodexSync,
@@ -2217,15 +2221,57 @@ function buildCodexContinuationMessage(
   ].join("\n");
 }
 
-function buildCodexPullRequestUpdateMessage(eventSummary: string): string {
+function buildCodexPullRequestUpdateMessage(
+  eventSummary: PullRequestEventSummary,
+): string {
   return [
     "A tracked GitHub PR changed.",
-    "Review the new PR feedback below and update the existing PR branch accordingly.",
-    "Do not only acknowledge the feedback. Inspect the worktree, make the requested fix, and run focused verification.",
-    "Commit and push if Git permissions allow it. If Git metadata permissions block commit or push, leave the verified changes in the worktree; AGSC will commit and push them.",
+    ...buildPullRequestUpdateInstructionLines(eventSummary),
     "",
-    eventSummary,
+    eventSummary.summary,
   ].join("\n");
+}
+
+function buildClaudePullRequestUpdateMessage(
+  eventSummary: PullRequestEventSummary,
+): string {
+  return [
+    "A tracked GitHub PR changed.",
+    ...buildPullRequestUpdateInstructionLines(eventSummary),
+    "",
+    eventSummary.summary,
+  ].join("\n");
+}
+
+function buildPullRequestUpdateInstructionLines(
+  eventSummary: PullRequestEventSummary,
+): string[] {
+  const lines: string[] = [];
+
+  if (eventSummary.hasRequiredReviewChanges) {
+    lines.push(
+      "Review feedback from the GitHub review flow is present; making the requested code changes is required.",
+      "Inspect the worktree, implement the requested fixes, run focused verification, and commit/push if Git permissions allow it.",
+      "If Git metadata permissions block commit or push, leave the verified changes in the worktree; AGSC will commit and push them.",
+    );
+  }
+
+  if (eventSummary.hasResponseRequiredComments) {
+    lines.push(
+      "Ordinary PR comments are also present; a response to each new comment is required.",
+      "Code changes for ordinary PR comments are optional and should only be made when the comment requests or clearly requires them.",
+      "If no code change is needed for an ordinary PR comment, answer the comment in the GitHub PR conversation instead of inventing a code change.",
+    );
+  }
+
+  if (lines.length === 0) {
+    lines.push(
+      "Review the new PR feedback and respond appropriately.",
+      "Make code changes only when the feedback requests or clearly requires them.",
+    );
+  }
+
+  return lines;
 }
 
 function buildCodexPullRequestUpdateContinuationMessage(
@@ -2317,17 +2363,12 @@ async function startClaudeWorkflow(
 async function notifyAgentAboutPullRequestUpdate(
   project: AGSCProject,
   workflow: AGSCTrackedWorkflow,
-  eventSummary: string,
+  eventSummary: PullRequestEventSummary,
 ): Promise<Partial<AGSCTrackedWorkflow>> {
   if (workflow.agent !== "codex" || !workflow.codexThreadId) {
     if (workflow.agent === "claude" && workflow.claudeSessionId) {
       const worktreeClaude = new ClaudeCodeWorkflows(project.rootPath);
-      const updateMessage = [
-        "A tracked GitHub PR changed.",
-        "Review and address this feedback:",
-        "",
-        eventSummary,
-      ].join("\n");
+      const updateMessage = buildClaudePullRequestUpdateMessage(eventSummary);
 
       void worktreeClaude.continueChat(workflow.claudeSessionId, updateMessage);
     }
@@ -2571,9 +2612,10 @@ async function buildPullRequestEventSummary(
   repository: GitHubRepositoryRef,
   workflow: AGSCTrackedWorkflow,
 ): Promise<PullRequestEventSummary | null> {
-  const [comments, reviews] = await Promise.all([
+  const [comments, reviews, reviewComments] = await Promise.all([
     github.listIssueComments(repository, workflow.pullNumber ?? 0),
     github.listPullRequestReviews(repository, workflow.pullNumber ?? 0),
+    github.listPullRequestReviewComments(repository, workflow.pullNumber ?? 0),
   ]);
   const synced = new Set(workflow.syncedPrEventIds ?? []);
   const events = [
@@ -2581,7 +2623,9 @@ async function buildPullRequestEventSummary(
       .filter((comment) => !isAGSCComment(comment.body))
       .map((comment) => ({
         id: `comment:${comment.id}`,
-        commentId: comment.id,
+        issueCommentId: comment.id,
+        reviewCommentId: undefined,
+        kind: "comment" as const,
         updatedAt: comment.updated_at,
         summary: formatPullRequestComment(comment),
       })),
@@ -2589,10 +2633,20 @@ async function buildPullRequestEventSummary(
       .filter((review) => review.body)
       .map((review) => ({
         id: `review:${review.id}`,
-        commentId: undefined,
+        issueCommentId: undefined,
+        reviewCommentId: undefined,
+        kind: "review" as const,
         updatedAt: review.submitted_at ?? "",
         summary: formatPullRequestReview(review),
       })),
+    ...reviewComments.map((comment) => ({
+      id: `review-comment:${comment.id}`,
+      issueCommentId: undefined,
+      reviewCommentId: comment.id,
+      kind: "review" as const,
+      updatedAt: comment.updated_at,
+      summary: formatPullRequestReviewComment(comment),
+    })),
   ]
     .filter((event) => !synced.has(event.id))
     .sort(
@@ -2607,19 +2661,28 @@ async function buildPullRequestEventSummary(
   return {
     summary: events.map((event) => event.summary).join("\n\n---\n\n"),
     eventIds: events.map((event) => event.id),
-    commentIds: events
-      .map((event) => event.commentId)
+    issueCommentIds: events
+      .map((event) => event.issueCommentId)
       .filter((commentId): commentId is number => typeof commentId === "number"),
+    reviewCommentIds: events
+      .map((event) => event.reviewCommentId)
+      .filter((commentId): commentId is number => typeof commentId === "number"),
+    hasResponseRequiredComments: events.some((event) => event.kind === "comment"),
+    hasRequiredReviewChanges: events.some((event) => event.kind === "review"),
   };
 }
 
-async function acknowledgePullRequestCommentEvents(
+async function acknowledgePullRequestFeedbackEvents(
   github: GitHubApiClient,
   repository: GitHubRepositoryRef,
-  commentIds: readonly number[],
+  eventSummary: PullRequestEventSummary,
 ): Promise<void> {
-  for (const commentId of commentIds) {
+  for (const commentId of eventSummary.issueCommentIds) {
     await github.addIssueCommentReaction(repository, commentId, "eyes");
+  }
+
+  for (const commentId of eventSummary.reviewCommentIds) {
+    await github.addPullRequestReviewCommentReaction(repository, commentId, "eyes");
   }
 }
 
@@ -2637,6 +2700,31 @@ function formatPullRequestReview(review: GitHubPullRequestReview): string {
     review.body ?? "",
     review.html_url,
   ].join("\n");
+}
+
+function formatPullRequestReviewComment(
+  comment: GitHubPullRequestReviewComment,
+): string {
+  const location = formatPullRequestReviewCommentLocation(comment);
+
+  return [
+    `Review comment by ${comment.user?.login ?? "unknown"} at ${comment.updated_at}${location ? ` on ${location}` : ""}:`,
+    comment.body ?? "",
+    comment.html_url,
+  ].join("\n");
+}
+
+function formatPullRequestReviewCommentLocation(
+  comment: GitHubPullRequestReviewComment,
+): string {
+  const path = comment.path?.trim();
+  const line = comment.line ?? comment.original_line;
+
+  if (!path) {
+    return "";
+  }
+
+  return typeof line === "number" ? `${path}:${line}` : path;
 }
 
 function mergeSyncedEventIds(
@@ -2979,6 +3067,7 @@ export const __testing = {
   buildCodexPullRequestUpdateContinuationMessage,
   buildCodexPullRequestUpdateGitState,
   buildCodexPullRequestUpdateMessage,
+  buildClaudePullRequestUpdateMessage,
   buildCodexAutoCommitMessage,
   buildImplementationCompleteComment,
   buildPullRequestMetadata,
@@ -3010,6 +3099,7 @@ export const __testing = {
   withPullRequestMetadata,
   formatPullRequestComment,
   formatPullRequestReview,
+  formatPullRequestReviewComment,
   extractCodexThreadIds,
   extractNotificationTurnId,
   findRegisteredWorktree,
