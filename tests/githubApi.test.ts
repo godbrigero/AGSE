@@ -7,10 +7,22 @@ test("parseGitHubRemoteUrl supports SSH GitHub remotes", () => {
     owner: "godbrigero",
     repo: "AGSE",
   });
+  assert.deepEqual(parseGitHubRemoteUrl("git@github.com:godbrigero/AGSE"), {
+    owner: "godbrigero",
+    repo: "AGSE",
+  });
 });
 
 test("parseGitHubRemoteUrl supports HTTPS GitHub remotes", () => {
   assert.deepEqual(parseGitHubRemoteUrl("https://github.com/org/repo.git"), {
+    owner: "org",
+    repo: "repo",
+  });
+  assert.deepEqual(parseGitHubRemoteUrl("https://github.com/org/repo"), {
+    owner: "org",
+    repo: "repo",
+  });
+  assert.deepEqual(parseGitHubRemoteUrl("  https://github.com/org/repo.git  "), {
     owner: "org",
     repo: "repo",
   });

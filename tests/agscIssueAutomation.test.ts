@@ -114,6 +114,46 @@ test("selectAgent supports assignee routing and untagged default mode", () => {
   );
 });
 
+test("selectAgent applies label precedence before assignee routing", () => {
+  const agscProject = project({
+    require_tag: true,
+    assignee_tags: { denis: "claude", godbrigero: "default" },
+    overwrite_tags: {
+      codex: "agse-codex",
+      claude: "agse-claude",
+      default: "agse",
+    },
+  });
+
+  assert.equal(
+    automation.selectAgent(
+      agscProject,
+      issue({
+        labels: [{ name: "agse-codex" }, { name: "agse-claude" }],
+        assignees: [{ login: "denis" }],
+      }),
+    ),
+    "codex",
+  );
+  assert.equal(
+    automation.selectAgent(
+      agscProject,
+      issue({
+        labels: [{ name: "agse-claude" }, { name: "agse" }],
+        assignees: [{ login: "godbrigero" }],
+      }),
+    ),
+    "claude",
+  );
+  assert.equal(
+    automation.selectAgent(
+      agscProject,
+      issue({ assignees: [{ login: "godbrigero" }] }),
+    ),
+    "codex",
+  );
+});
+
 test("isLocalIssue accepts either author or assignee as the local GitHub user", () => {
   assert.equal(automation.isLocalIssue(issue(), "godbrigero"), true);
   assert.equal(
@@ -133,6 +173,19 @@ test("isLocalIssue accepts either author or assignee as the local GitHub user", 
   assert.equal(automation.isLocalIssue(issue(), null), false);
 });
 
+test("slugify normalizes issue titles for stable branch names", () => {
+  assert.equal(
+    automation.slugify("  Add!!! Tests_for Codex   Handoff???  "),
+    "add-tests-for-codex-handoff",
+  );
+  assert.equal(
+    automation.slugify(
+      "This Issue Title Is Intentionally Long Enough To Exceed The Branch Segment Limit",
+    ),
+    "this-issue-title-is-intentionally-long-enough-to-exceed-the",
+  );
+});
+
 test("issue branch, worktree, and pull request title are stable and identifiable", () => {
   const sample = issue();
 
@@ -147,6 +200,33 @@ test("issue branch, worktree, and pull request title are stable and identifiable
   assert.equal(
     automation.buildPullRequestTitle(sample),
     "Issue #42: Add tests for Codex handoff!",
+  );
+});
+
+test("initial pull request body trims issue text and falls back for empty bodies", () => {
+  assert.equal(
+    automation.buildInitialPullRequestBody(
+      issue({ body: "\n  Add coverage for AGSC helpers.  \n" }),
+    ),
+    [
+      "## Issue",
+      "",
+      "Closes #42",
+      "",
+      "Add coverage for AGSC helpers.",
+    ].join("\n"),
+  );
+  assert.equal(
+    automation.buildInitialPullRequestBody(issue({ body: null })),
+    ["## Issue", "", "Closes #42", "", "_No issue description provided._"].join(
+      "\n",
+    ),
+  );
+  assert.equal(
+    automation.buildInitialPullRequestBody(issue({ body: "   " })),
+    ["## Issue", "", "Closes #42", "", "_No issue description provided._"].join(
+      "\n",
+    ),
   );
 });
 
@@ -356,6 +436,20 @@ test("Codex turn ids can be read from completion notifications", () => {
     }),
     "turn-2",
   );
+  assert.equal(
+    automation.extractNotificationTurnId({
+      method: "turn/completed",
+      params: { turn: { id: 42 } },
+    }),
+    undefined,
+  );
+  assert.equal(
+    automation.extractNotificationTurnId({
+      method: "turn/completed",
+      params: null,
+    }),
+    undefined,
+  );
 });
 
 test("workflowNeedsAgentStart catches missing agent sessions", () => {
@@ -393,8 +487,14 @@ test("extractCodexThreadIds handles app-server list response shapes", () => {
         { id: "thread-a" },
         { sessionId: "thread-b" },
         { id: "thread-c", sessionId: "thread-c-alt" },
+        { id: 42 },
+        null,
       ],
     }),
     new Set(["thread-a", "thread-b", "thread-c", "thread-c-alt"]),
+  );
+  assert.deepEqual(
+    automation.extractCodexThreadIds({ data: { id: "thread-a" } }),
+    new Set(),
   );
 });

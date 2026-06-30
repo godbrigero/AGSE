@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AGSCStateStore, type AGSCTrackedWorkflow } from "../src/agscState.ts";
@@ -37,6 +37,17 @@ test("AGSCStateStore starts empty when no state file exists", async () => {
     const state = await new AGSCStateStore(projectRootPath).read();
 
     assert.deepEqual(state, { workflows: [] });
+  });
+});
+
+test("AGSCStateStore normalizes malformed workflow lists to empty", async () => {
+  await withTempProject(async (projectRootPath) => {
+    const store = new AGSCStateStore(projectRootPath);
+
+    await mkdir(join(projectRootPath, ".agse"), { recursive: true });
+    await writeFile(store.statePath, '{"workflows":{"issueId":1}}\n', "utf8");
+
+    assert.deepEqual(await store.read(), { workflows: [] });
   });
 });
 
