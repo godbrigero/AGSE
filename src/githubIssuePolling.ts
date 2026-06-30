@@ -185,7 +185,7 @@ export class GitHubIssuePoller {
         onEvent: (event) => {
           console.log(
             info(
-              `[github] ${state.project.name}: received ${event.eventName} webhook${event.deliveryId ? ` (${event.deliveryId})` : ""}; scheduling poll.`,
+              `[github] ${state.project.name}: received ${event.eventName} webhook${event.deliveryId ? ` (${event.deliveryId})` : ""}; scheduling immediate sync poll.`,
             ),
           );
           void runSerializedProjectPoll(state, () => this.pollProject(state));
