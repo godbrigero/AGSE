@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "start": "node --experimental-strip-types src/main.ts",
     "dev": "node --watch --experimental-strip-types src/main.ts",

@@ -31,14 +31,29 @@ The app entrypoint is `src/main.ts`. This project intentionally does not compile
 
 ## AGSC project discovery
 
-AGSC projects are folders that contain an `agse.config.ts` marker file. The marker exports a typed config object:
+AGSC projects are folders that contain an `agse.config.ts` marker file. Create or replace that file in the current folder with:
+
+```sh
+npx initialize-agse@latest .
+```
+
+Or install it into another repo folder:
+
+```sh
+npx initialize-agse@latest path/to/repo
+```
+
+The initializer overwrites any existing `agse.config.ts` in the target folder. It writes a self-contained typed config object:
 
 ```ts
-import type { AGSCConfigOptions } from "./src/agscConfig.ts";
+export interface AGSCConfigOptions {
+  require_tag?: boolean;
+  overwrite_tags?: Record<"codex" | "claude" | "default", string>;
+  assignee_tags?: Record<string, "codex" | "claude" | "default">;
+  restrict_user_to_local_only?: boolean;
+}
 
-export interface AGSCWorkspaceConfig extends AGSCConfigOptions {}
-
-const config: AGSCWorkspaceConfig = {
+const config: AGSCConfigOptions = {
   require_tag: true,
   overwrite_tags: {
     codex: "agse-codex",
