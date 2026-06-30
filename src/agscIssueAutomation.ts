@@ -1,5 +1,6 @@
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { simpleGit, type SimpleGit } from "simple-git";
 import type { AGSCProject } from "./agscWorkspace.ts";
 import {
@@ -11,11 +12,25 @@ import {
   CodexWorkflows,
   type CodexWorkflowOptions,
 } from "./codexIntegration/index.ts";
+import {
+  removeCodexLocalThreadCatalogEntries,
+  scrubCodexLocalThreadCatalog,
+  upsertCodexLocalThreadCatalogEntry,
+} from "./codexIntegration/threadCatalog.ts";
+import {
+  registerCodexWorkspaceRoot,
+  resolveCodexHome,
+  scrubCodexThreadWorkspaceReferences,
+  scrubCodexWorkspaceRoots,
+  unregisterCodexWorkspaceRoot,
+} from "./codexIntegration/workspaceRoots.ts";
 import { ClaudeCodeWorkflows } from "./claudeCodeIntegration/index.ts";
 import {
   GitHubApiClient,
   type GitHubIssue,
+  type GitHubIssueComment,
   type GitHubPullRequest,
+  type GitHubPullRequestReview,
   type GitHubRepositoryRef,
 } from "./githubApi.ts";
 import { info, style, success, warning } from "./terminalStyle.ts";
@@ -40,16 +55,60 @@ export type IssueAutomationResult =
     };
 
 const DEFAULT_AGENT: AGSCAgentName = "codex";
-const CODEX_HANDOFF_PROMPT_VERSION = 5;
+const CODEX_HANDOFF_PROMPT_VERSION = 6;
 const CODEX_HANDOFF_TIMEOUT_MS = 6 * 60 * 60_000;
+const CODEX_PLANNING_TIMEOUT_MS = 20 * 60_000;
 const CODEX_HANDOFF_MAX_TURNS = 4;
 const CODEX_HANDOFF_OPTIONS: CodexWorkflowOptions = {
   sandbox: "danger-full-access",
   approvalPolicy: "never",
   experimentalApi: true,
+  useDaemonProxy: true,
+  useRemoteControlDaemon: false,
+  requireDaemonProxy: true,
+  useDesktopApp: true,
+  requireDesktopApp: true,
 };
 const activeCodexHandoffs = new Map<number, CodexWorkflows>();
+const terminalCodexTurnStatuses = new Set(["interrupted", "failed", "cancelled"]);
+let codexHandoffWorkflowFactory = (projectRootPath: string): CodexWorkflows =>
+  new CodexWorkflows(projectRootPath, CODEX_HANDOFF_OPTIONS);
+type CodexWorkspaceRootRegistrar = typeof registerCodexWorkspaceRoot;
+let codexWorkspaceRootRegistrar: CodexWorkspaceRootRegistrar =
+  registerCodexWorkspaceRoot;
+type CodexWorkspaceRootUnregistrar = typeof unregisterCodexWorkspaceRoot;
+let codexWorkspaceRootUnregistrar: CodexWorkspaceRootUnregistrar =
+  unregisterCodexWorkspaceRoot;
+type CodexWorkspaceRootScrubber = typeof scrubStaleCodexWorktreeProjects;
+let codexWorkspaceRootScrubber: CodexWorkspaceRootScrubber =
+  scrubStaleCodexWorktreeProjects;
 type CodexAutoCommitReason = "handoff" | "pull-request-update";
+const AGSC_IMPLEMENTATION_DONE_MARKER = "<!-- agsc:implementation-complete -->";
+const AGSC_METADATA_OPEN = "<!-- agsc:metadata";
+const AGSC_METADATA_CLOSE = "-->";
+
+type AGSCPullRequestMetadata = {
+  version: 1;
+  issueId?: number;
+  issueNumber: number;
+  issueTitle?: string;
+  issueUrl?: string;
+  agent: AGSCAgentName;
+  branchName: string;
+  worktreePath?: string;
+  codexThreadId?: string;
+  codexPlanningTurnId?: string;
+  codexImplementationTurnId?: string;
+  codexActiveTurnId?: string;
+  agentHandoffPhase?: AGSCTrackedWorkflow["agentHandoffPhase"];
+  issueClosedByAGSCAt?: string;
+};
+
+type PullRequestEventSummary = {
+  summary: string;
+  eventIds: string[];
+  commentIds: number[];
+};
 
 export async function handleGitHubIssueForProject({
   project,
@@ -88,8 +147,14 @@ export async function handleGitHubIssueForProject({
   const state = await stateStore.read();
   const existing = state.workflows.find((entry) => entry.issueId === issue.id);
   const branchName = existing?.branchName ?? buildIssueBranchName(issue);
-  const worktreePath =
-    existing?.worktreePath ?? buildIssueWorktreePath(project.rootPath, issue);
+  const worktreePath = selectIssueWorktreePath(
+    project.rootPath,
+    issue,
+    existing?.worktreePath,
+  );
+  const worktreePathChanged = Boolean(
+    existing?.worktreePath && !samePath(existing.worktreePath, worktreePath),
+  );
   const baseBranch = await getRemoteDefaultBranch(project.git.git);
 
   console.log(
@@ -110,12 +175,23 @@ export async function handleGitHubIssueForProject({
     github,
     repository,
     issue,
+    agent: selectedAgent,
     branchName,
+    worktreePath,
     baseBranch,
   });
+  const issueClosedByAGSCAt =
+    existing?.issueClosedByAGSCAt ??
+    (await closeIssueForPullRequest({
+      github,
+      repository,
+      issue,
+      pullRequest,
+    }));
 
   const workflow: AGSCTrackedWorkflow = {
     ...existing,
+    ...(worktreePathChanged ? resetCodexSessionFields() : {}),
     issueId: issue.id,
     issueNumber: issue.number,
     issueTitle: issue.title,
@@ -126,6 +202,7 @@ export async function handleGitHubIssueForProject({
     pullNumber: pullRequest.number,
     pullUrl: pullRequest.html_url,
     pullState: pullRequest.state,
+    issueClosedByAGSCAt,
     lastPullUpdatedAt: existing?.lastPullUpdatedAt ?? pullRequest.updated_at,
   };
 
@@ -204,14 +281,20 @@ export async function syncTrackedPullRequests(
       continue;
     }
 
-    if (issue.state !== "open") {
+    if (issue.state !== "open" && !workflow.issueClosedByAGSCAt) {
       await cleanupClosedWorkflow(project, workflow, stateStore, "issue closed");
       continue;
     }
 
+    const migratedWorkflow = await migrateTrackedWorkflowWorktree(
+      project,
+      issue,
+      workflow,
+      stateStore,
+    );
     const currentWorkflow = await validateTrackedAgentSession(
       project,
-      workflow,
+      migratedWorkflow,
       stateStore,
     );
 
@@ -231,43 +314,150 @@ export async function syncTrackedPullRequests(
       );
     }
 
-    if (pullRequest.updated_at === workflow.lastPullUpdatedAt) {
-      continue;
-    }
+    const workflowAfterCodexSync = await syncCodexImplementationStatus(
+      project,
+      repository,
+      currentWorkflow,
+      github,
+    );
 
     const eventSummary = await buildPullRequestEventSummary(
       github,
       repository,
-      workflow,
+      workflowAfterCodexSync,
     );
 
     if (!eventSummary) {
-      await stateStore.upsertWorkflow({
-        ...workflow,
-        pullState: pullRequest.state,
-        lastPullUpdatedAt: pullRequest.updated_at,
-      });
+      if (pullRequest.updated_at !== workflow.lastPullUpdatedAt) {
+        await stateStore.upsertWorkflow({
+          ...workflowAfterCodexSync,
+          pullState: pullRequest.state,
+          lastPullUpdatedAt: pullRequest.updated_at,
+        });
+      }
       continue;
     }
 
     try {
-      await notifyAgentAboutPullRequestUpdate(project, workflow, eventSummary);
+      const notificationResult = await notifyAgentAboutPullRequestUpdate(
+        project,
+        workflowAfterCodexSync,
+        eventSummary.summary,
+      );
+      await acknowledgePullRequestCommentEvents(
+        github,
+        repository,
+        eventSummary.commentIds,
+      );
+      await stateStore.upsertWorkflow({
+        ...workflowAfterCodexSync,
+        ...notificationResult,
+        pullState: pullRequest.state,
+        lastPullUpdatedAt: pullRequest.updated_at,
+        lastSyncedPrEventAt: new Date().toISOString(),
+        syncedPrEventIds: mergeSyncedEventIds(
+          workflowAfterCodexSync.syncedPrEventIds,
+          eventSummary.eventIds,
+        ),
+      });
     } catch (error) {
       console.log(
         warning(
-          `[agsc] ${project.name} #${workflow.issueNumber}: failed to notify ${workflow.agent} about PR update; will retry next poll: ${formatError(error)}`,
+          `[agsc] ${project.name} #${workflowAfterCodexSync.issueNumber}: failed to notify ${workflowAfterCodexSync.agent} about PR update; will retry next poll: ${formatError(error)}`,
         ),
       );
       continue;
     }
-
-    await stateStore.upsertWorkflow({
-      ...workflow,
-      pullState: pullRequest.state,
-      lastPullUpdatedAt: pullRequest.updated_at,
-      lastSyncedPrEventAt: new Date().toISOString(),
-    });
   }
+}
+
+export async function recoverTrackedPullRequests(
+  project: AGSCProject,
+  repository: GitHubRepositoryRef,
+  github: GitHubApiClient,
+): Promise<AGSCTrackedWorkflow[]> {
+  const pullRequests = await github.listOpenPullRequests(repository);
+  const stateStore = new AGSCStateStore(project.rootPath);
+  const state = await stateStore.read();
+  const closedWorkflowIssueIds = new Set(
+    state.closedWorkflows.map((workflow) => workflow.issueId),
+  );
+  const recovered: AGSCTrackedWorkflow[] = [];
+
+  for (const pullRequest of pullRequests) {
+    const metadata = parsePullRequestMetadata(pullRequest.body);
+
+    if (!metadata) {
+      continue;
+    }
+
+    if (metadata.issueId && closedWorkflowIssueIds.has(metadata.issueId)) {
+      continue;
+    }
+
+    if (
+      state.workflows.some(
+        (workflow) =>
+          workflow.pullNumber === pullRequest.number ||
+          workflow.issueNumber === metadata.issueNumber,
+      )
+    ) {
+      continue;
+    }
+
+    const issue = await github.getIssue(repository, metadata.issueNumber);
+    const worktreePath = selectIssueWorktreePath(
+      project.rootPath,
+      {
+        number: metadata.issueNumber,
+        title: metadata.issueTitle ?? issue.title,
+      } as GitHubIssue,
+      metadata.worktreePath,
+    );
+    const branchName = metadata.branchName || pullRequest.head.ref;
+    const baseBranch = pullRequest.base.ref || (await getRemoteDefaultBranch(project.git.git));
+
+    await ensureWorktree({
+      git: project.git.git,
+      projectRootPath: project.rootPath,
+      worktreePath,
+      branchName,
+      baseBranch,
+    });
+
+    const workflow: AGSCTrackedWorkflow = {
+      issueId: metadata.issueId ?? issue.id,
+      issueNumber: metadata.issueNumber,
+      issueTitle: metadata.issueTitle ?? issue.title,
+      issueUrl: metadata.issueUrl ?? issue.html_url,
+      agent: metadata.agent,
+      worktreePath,
+      branchName,
+      pullNumber: pullRequest.number,
+      pullUrl: pullRequest.html_url,
+      pullState: pullRequest.state,
+      codexThreadId: metadata.codexThreadId,
+      codexPlanningTurnId: metadata.codexPlanningTurnId,
+      codexImplementationTurnId: metadata.codexImplementationTurnId,
+      codexActiveTurnId: metadata.codexActiveTurnId,
+      agentHandoffPhase: metadata.agentHandoffPhase,
+      issueClosedByAGSCAt: metadata.issueClosedByAGSCAt,
+      agentHandoffVersion: metadata.codexThreadId
+        ? CODEX_HANDOFF_PROMPT_VERSION
+        : undefined,
+      lastPullUpdatedAt: pullRequest.updated_at,
+    };
+
+    await stateStore.upsertWorkflow(workflow);
+    recovered.push(workflow);
+    console.log(
+      success(
+        `[agsc] Recovered ${project.name} PR #${pullRequest.number} for issue #${workflow.issueNumber} from PR metadata.`,
+      ),
+    );
+  }
+
+  return recovered;
 }
 
 async function validateTrackedAgentSession(
@@ -279,7 +469,11 @@ async function validateTrackedAgentSession(
     return workflow;
   }
 
-  const exists = await codexThreadExists(project.rootPath, workflow.codexThreadId);
+  const exists = await codexThreadExists(
+    workflow.worktreePath,
+    workflow.codexThreadId,
+    workflow.issueId,
+  );
 
   if (exists) {
     return workflow;
@@ -301,14 +495,62 @@ async function validateTrackedAgentSession(
   return nextWorkflow;
 }
 
+async function migrateTrackedWorkflowWorktree(
+  project: AGSCProject,
+  issue: GitHubIssue,
+  workflow: AGSCTrackedWorkflow,
+  stateStore: AGSCStateStore,
+): Promise<AGSCTrackedWorkflow> {
+  const worktreePath = selectIssueWorktreePath(
+    project.rootPath,
+    issue,
+    workflow.worktreePath,
+  );
+
+  if (samePath(workflow.worktreePath, worktreePath)) {
+    return workflow;
+  }
+
+  console.log(
+    info(
+      `[agsc] ${project.name} #${workflow.issueNumber}: migrating worktree to ${worktreePath}`,
+    ),
+  );
+  await ensureWorktree({
+    git: project.git.git,
+    projectRootPath: project.rootPath,
+    worktreePath,
+    branchName: workflow.branchName,
+    baseBranch: await getRemoteDefaultBranch(project.git.git),
+  });
+
+  const migratedWorkflow: AGSCTrackedWorkflow = {
+    ...workflow,
+    ...resetCodexSessionFields(),
+    worktreePath,
+  };
+  await stateStore.upsertWorkflow(migratedWorkflow);
+
+  return migratedWorkflow;
+}
+
 async function codexThreadExists(
   projectRootPath: string,
   threadId: string,
+  issueId?: number,
 ): Promise<boolean> {
-  const codex = new CodexWorkflows(projectRootPath, { requestTimeoutMs: 10_000 });
+  const activeCodex = issueId
+    ? activeCodexHandoffs.get(issueId)
+    : undefined;
+  const codex = activeCodex ?? createCodexHandoffWorkflows(projectRootPath);
 
   try {
-    const list = await codex.listChats({});
+    const list = await codex.listChats({
+      cwd: projectRootPath,
+      sourceKinds: [],
+      archived: false,
+      limit: 50,
+    });
 
     return extractCodexThreadIds(list).has(threadId);
   } catch (error) {
@@ -319,7 +561,9 @@ async function codexThreadExists(
     );
     return true;
   } finally {
-    codex.close();
+    if (!activeCodex) {
+      codex.close();
+    }
   }
 }
 
@@ -422,12 +666,78 @@ function buildIssueWorktreePath(
   projectRootPath: string,
   issue: GitHubIssue,
 ): string {
+  const rootKey = createHash("sha1")
+    .update(`${resolve(projectRootPath)}:${issue.number}:${issue.title}`)
+    .digest("hex")
+    .slice(0, 4);
+
   return join(
-    projectRootPath,
+    resolveCodexWorktreesRoot(),
+    rootKey,
+    `issue-${issue.number}-${slugify(issue.title)}`,
+  );
+}
+
+function resolveCodexWorktreesRoot(): string {
+  return (
+    process.env.AGSE_CODEX_WORKTREES_ROOT?.trim() ||
+    join(resolveCodexHome(), "worktrees")
+  );
+}
+
+function buildLegacyIssueWorktreePath(
+  projectRootPath: string,
+  issue: GitHubIssue,
+): string {
+  return join(
+    resolve(projectRootPath),
     ".agse",
     "worktrees",
     `issue-${issue.number}-${slugify(issue.title)}`,
   );
+}
+
+function selectIssueWorktreePath(
+  projectRootPath: string,
+  issue: GitHubIssue,
+  existingWorktreePath?: string,
+): string {
+  if (
+    existingWorktreePath &&
+    !isLegacyIssueWorktreePath(projectRootPath, existingWorktreePath)
+  ) {
+    return existingWorktreePath;
+  }
+
+  return buildIssueWorktreePath(projectRootPath, issue);
+}
+
+function isLegacyIssueWorktreePath(
+  projectRootPath: string,
+  worktreePath: string,
+): boolean {
+  const legacyRoot = `${join(resolve(projectRootPath), ".agse", "worktrees")}/`;
+  return `${resolve(worktreePath)}/`.startsWith(legacyRoot);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left) === resolve(right);
+}
+
+function resetCodexSessionFields(): Partial<AGSCTrackedWorkflow> {
+  return {
+    codexThreadId: undefined,
+    codexPlanningTurnId: undefined,
+    codexImplementationTurnId: undefined,
+    codexActiveTurnId: undefined,
+    codexLastPlan: undefined,
+    codexImplementationStartedAt: undefined,
+    codexImplementationCompletedAt: undefined,
+    codexImplementationCommentedAt: undefined,
+    agentHandoffStartedAt: undefined,
+    agentHandoffVersion: undefined,
+    agentHandoffPhase: undefined,
+  };
 }
 
 async function ensureWorktree(input: {
@@ -445,12 +755,23 @@ async function ensureWorktree(input: {
     input.branchName,
   );
 
-  if (registeredWorktree && (await pathExists(registeredWorktree.path))) {
+  if (
+    registeredWorktree &&
+    resolve(registeredWorktree.path) === resolve(input.worktreePath) &&
+    (await pathExists(registeredWorktree.path))
+  ) {
     console.log(info(`[agsc] Reusing worktree ${input.worktreePath}`));
     return;
   }
 
-  if (registeredWorktree) {
+  if (registeredWorktree && (await pathExists(registeredWorktree.path))) {
+    await removeCleanMismatchedWorktree({
+      git: input.git,
+      registeredWorktree,
+      targetWorktreePath: input.worktreePath,
+      branchName: input.branchName,
+    });
+  } else if (registeredWorktree) {
     console.log(
       warning(
         `[agsc] Pruning stale worktree registration for ${input.branchName}.`,
@@ -471,6 +792,10 @@ async function ensureWorktree(input: {
   if (hasRemoteBranch) {
     console.log(
       info(`[agsc] Creating worktree from remote branch ${input.branchName}`),
+    );
+    await fetchRemoteBranchWithOptionalGitHubToken(
+      input.git,
+      input.branchName,
     );
     await input.git.raw([
       "worktree",
@@ -504,7 +829,11 @@ async function ensureWorktree(input: {
     "-m",
     `chore(agsc): start ${basename(input.branchName)}`,
   ]);
-  await worktreeGit.push(["-u", "origin", input.branchName]);
+  await pushWithOptionalGitHubToken(worktreeGit, [
+    "-u",
+    "origin",
+    input.branchName,
+  ]);
 }
 
 type RegisteredWorktree = {
@@ -558,11 +887,45 @@ async function ensureAGSCGitExclude(projectRootPath: string): Promise<void> {
   }
 }
 
+async function removeCleanMismatchedWorktree(input: {
+  git: SimpleGit;
+  registeredWorktree: RegisteredWorktree;
+  targetWorktreePath: string;
+  branchName: string;
+}): Promise<void> {
+  const status = await simpleGit({
+    baseDir: input.registeredWorktree.path,
+  }).status();
+
+  if (!status.isClean()) {
+    throw new Error(
+      [
+        `Cannot move AGSC worktree for ${input.branchName} to ${input.targetWorktreePath}.`,
+        `Existing worktree has uncommitted changes: ${input.registeredWorktree.path}`,
+      ].join(" "),
+    );
+  }
+
+  console.log(
+    info(
+      `[agsc] Moving clean worktree for ${input.branchName} from ${input.registeredWorktree.path} to ${input.targetWorktreePath}`,
+    ),
+  );
+  await input.git.raw([
+    "worktree",
+    "remove",
+    "--force",
+    input.registeredWorktree.path,
+  ]);
+}
+
 async function ensurePullRequest(input: {
   github: GitHubApiClient;
   repository: GitHubRepositoryRef;
   issue: GitHubIssue;
+  agent: AGSCAgentName;
   branchName: string;
+  worktreePath: string;
   baseBranch: string;
 }): Promise<GitHubPullRequest> {
   const existingPullRequests = await input.github.listOpenPullRequestsForHead(
@@ -582,10 +945,50 @@ async function ensurePullRequest(input: {
   console.log(info(`[agsc] Creating PR for ${input.branchName}`));
   return input.github.createPullRequest(input.repository, {
     title: buildPullRequestTitle(input.issue),
-    body: buildInitialPullRequestBody(input.issue),
+    body: buildInitialPullRequestBody(input.issue, {
+      version: 1,
+      issueId: input.issue.id,
+      issueNumber: input.issue.number,
+      issueTitle: input.issue.title,
+      issueUrl: input.issue.html_url,
+      agent: input.agent,
+      branchName: input.branchName,
+      worktreePath: input.worktreePath,
+    }),
     head: input.branchName,
     base: input.baseBranch,
   });
+}
+
+async function closeIssueForPullRequest(input: {
+  github: GitHubApiClient;
+  repository: GitHubRepositoryRef;
+  issue: GitHubIssue;
+  pullRequest: GitHubPullRequest;
+}): Promise<string | undefined> {
+  if (input.issue.state !== "open") {
+    return undefined;
+  }
+
+  try {
+    await input.github.updateIssue(input.repository, input.issue.number, {
+      state: "closed",
+    });
+    const closedAt = new Date().toISOString();
+    console.log(
+      success(
+        `[agsc] Closed issue #${input.issue.number} after creating PR #${input.pullRequest.number}.`,
+      ),
+    );
+    return closedAt;
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Could not close issue #${input.issue.number} after creating PR #${input.pullRequest.number}: ${formatError(error)}`,
+      ),
+    );
+    return undefined;
+  }
 }
 
 async function startAgentIfNeeded(
@@ -598,24 +1001,9 @@ async function startAgentIfNeeded(
 ): Promise<void> {
   if (workflow.agent === "codex" && workflow.codexThreadId) {
     if (workflow.agentHandoffVersion !== CODEX_HANDOFF_PROMPT_VERSION) {
-      const gitState = await inspectCodexHandoffGitState(workflow);
-
-      if (!gitState.needsContinuation) {
-        await new AGSCStateStore(project.rootPath).upsertWorkflow({
-          ...workflow,
-          agentHandoffVersion: CODEX_HANDOFF_PROMPT_VERSION,
-        });
-        console.log(
-          success(
-            `[agsc] Codex handoff for issue #${workflow.issueNumber} is already complete despite old prompt version: ${gitState.summary}.`,
-          ),
-        );
-        return;
-      }
-
       console.log(
         warning(
-          `[agsc] Codex handoff for issue #${workflow.issueNumber} uses an old prompt version and still needs attention (${gitState.summary}); starting a fresh thread.`,
+          `[agsc] Codex handoff for issue #${workflow.issueNumber} uses an old prompt version; starting a fresh PR chat handoff.`,
         ),
       );
       await startCodexWorkflow(
@@ -624,7 +1012,12 @@ async function startAgentIfNeeded(
         {
           ...workflow,
           codexThreadId: undefined,
+          codexPlanningTurnId: undefined,
+          codexImplementationTurnId: undefined,
+          codexActiveTurnId: undefined,
+          codexLastPlan: undefined,
           agentHandoffStartedAt: undefined,
+          agentHandoffPhase: undefined,
         },
         issue,
         pullRequest,
@@ -681,15 +1074,29 @@ async function startCodexWorkflow(
     return;
   }
 
-  const projectCodex = createCodexHandoffWorkflows(project.rootPath);
+  const projectCodex = createCodexHandoffWorkflows(workflow.worktreePath);
   const title = buildPullRequestTitle(issue);
+  await registerCodexWorktreeProject(project, workflow, undefined, title);
   const thread = await projectCodex.startChat({
-    cwd: project.rootPath,
+    desktopApp: true,
+    requireDesktopApp: true,
     title,
+    input: [],
+    cwd: workflow.worktreePath,
+    workspaceRoots: [workflow.worktreePath],
+    runtimeWorkspaceRoots: [workflow.worktreePath],
     sandbox: CODEX_HANDOFF_OPTIONS.sandbox,
     approvalPolicy: CODEX_HANDOFF_OPTIONS.approvalPolicy,
+    ephemeral: false,
+    sessionStartSource: "startup",
+    threadSource: "user",
+    threadStartKind: "agse-pr-worktree",
   });
   await renameCodexThread(projectCodex, thread.id, title);
+  await registerCodexThreadInLocalCatalog(thread.id, title, workflow);
+  await registerCodexWorktreeProject(project, workflow, thread.id, title);
+  await verifyCodexThreadIsDiscoverable(projectCodex, workflow, thread.id);
+  await registerCodexWorktreeProject(project, workflow, thread.id, title);
   activeCodexHandoffs.set(workflow.issueId, projectCodex);
 
   await new AGSCStateStore(project.rootPath).upsertWorkflow({
@@ -697,52 +1104,121 @@ async function startCodexWorkflow(
     codexThreadId: thread.id,
     agentHandoffStartedAt: new Date().toISOString(),
     agentHandoffVersion: CODEX_HANDOFF_PROMPT_VERSION,
+    agentHandoffPhase: "planning",
   });
-
   console.log(
     success(
-      `[agsc] Handed off PR #${pullRequest.number} / issue #${issue.number} to Codex thread ${thread.id}.`,
+      `[agsc] Created PR chat ${thread.id} for PR #${pullRequest.number} / issue #${issue.number}.`,
     ),
   );
 
-  void runCodexHandoffTurn({
+  void runCodexPlanningAndImplementation({
     project,
+    repository,
     workflow,
     issue,
+    pullRequest,
+    github,
     codex: projectCodex,
     threadId: thread.id,
-    message: buildCodexInitialHandoffMessage(
-      title,
-      issue,
-      pullRequest,
-      workflow,
-    ),
   });
 }
 
-async function runCodexHandoffTurn(input: {
+async function runCodexPlanningAndImplementation(input: {
   project: AGSCProject;
+  repository: GitHubRepositoryRef;
   workflow: AGSCTrackedWorkflow;
   issue: GitHubIssue;
+  pullRequest: GitHubPullRequest;
+  github: GitHubApiClient;
   codex: CodexWorkflows;
   threadId: string;
-  message: string;
 }): Promise<void> {
   try {
-    await runCodexHandoffUntilGitSettles(input);
+    const planResult = await input.codex.sendMessage(
+      input.threadId,
+      buildPlanningPrompt(input.issue, input.pullRequest, input.workflow),
+      {
+        cwd: input.workflow.worktreePath,
+        runtimeWorkspaceRoots: [input.workflow.worktreePath],
+        timeoutMs: CODEX_PLANNING_TIMEOUT_MS,
+      },
+    );
+
+    const planTurnId = extractNotificationTurnId(planResult.completed);
+    const plan = extractProposedPlan(planResult.finalResponse);
+    let updatedPullRequest = await input.github.updatePullRequestBody(
+      input.repository,
+      input.pullRequest.number,
+      buildPlannedPullRequestBody(
+        input.issue,
+        plan,
+        buildPullRequestMetadata(input.issue, input.workflow, {
+          codexThreadId: input.threadId,
+          codexPlanningTurnId: planTurnId,
+          agentHandoffPhase: "planning",
+        }),
+      ),
+    );
+    const implementation = await input.codex.startTurnDetached({
+      threadId: input.threadId,
+      input: buildImplementationPrompt(input.issue, updatedPullRequest, plan),
+      cwd: input.workflow.worktreePath,
+      runtimeWorkspaceRoots: [input.workflow.worktreePath],
+      sandbox: CODEX_HANDOFF_OPTIONS.sandbox,
+      approvalPolicy: CODEX_HANDOFF_OPTIONS.approvalPolicy,
+    });
+    updatedPullRequest = await input.github.updatePullRequestBody(
+      input.repository,
+      input.pullRequest.number,
+      buildPlannedPullRequestBody(
+        input.issue,
+        plan,
+        buildPullRequestMetadata(input.issue, input.workflow, {
+          codexThreadId: input.threadId,
+          codexPlanningTurnId: planTurnId,
+          codexImplementationTurnId: implementation.turnId,
+          codexActiveTurnId: implementation.turnId,
+          agentHandoffPhase: "implementing",
+        }),
+      ),
+    );
+
+    await new AGSCStateStore(input.project.rootPath).upsertWorkflow({
+      ...input.workflow,
+      codexThreadId: input.threadId,
+      codexPlanningTurnId: planTurnId,
+      codexImplementationTurnId: implementation.turnId,
+      codexActiveTurnId: implementation.turnId,
+      codexLastPlan: plan,
+      codexImplementationStartedAt: new Date().toISOString(),
+      agentHandoffStartedAt: input.workflow.agentHandoffStartedAt ?? new Date().toISOString(),
+      agentHandoffVersion: CODEX_HANDOFF_PROMPT_VERSION,
+      agentHandoffPhase: "implementing",
+      lastPullUpdatedAt: updatedPullRequest.updated_at,
+    });
+    console.log(
+      success(
+        `[agsc] Updated PR #${input.pullRequest.number} with Codex plan and started detached implementation turn ${implementation.turnId ?? "unknown"}.`,
+      ),
+    );
   } catch (error) {
     await new AGSCStateStore(input.project.rootPath).upsertWorkflow({
       ...input.workflow,
       codexThreadId: undefined,
+      codexPlanningTurnId: undefined,
+      codexImplementationTurnId: undefined,
+      codexActiveTurnId: undefined,
+      codexLastPlan: undefined,
       agentHandoffStartedAt: undefined,
       agentHandoffVersion: undefined,
+      agentHandoffPhase: undefined,
     });
     console.log(
       warning(
         `[agsc] Failed to hand off issue #${input.issue.number} to Codex: ${formatError(error)}`,
       ),
     );
-  } finally {
     closeCodexHandoff(input.workflow.issueId);
   }
 }
@@ -760,6 +1236,7 @@ async function runCodexHandoffUntilGitSettles(input: {
   for (let turnIndex = 1; turnIndex <= CODEX_HANDOFF_MAX_TURNS; turnIndex += 1) {
     const result = await input.codex.sendMessage(input.threadId, message, {
       cwd: input.workflow.worktreePath,
+      runtimeWorkspaceRoots: [input.workflow.worktreePath],
       timeoutMs: CODEX_HANDOFF_TIMEOUT_MS,
     });
 
@@ -819,6 +1296,7 @@ async function runCodexPullRequestUpdateUntilGitSettles(input: {
   for (let turnIndex = 1; turnIndex <= CODEX_HANDOFF_MAX_TURNS; turnIndex += 1) {
     const result = await input.codex.sendMessage(input.threadId, message, {
       cwd: input.workflow.worktreePath,
+      runtimeWorkspaceRoots: [input.workflow.worktreePath],
       timeoutMs: CODEX_HANDOFF_TIMEOUT_MS,
     });
 
@@ -914,7 +1392,82 @@ async function finalizeCodexWorktreeChanges(
         `[agsc] Issue #${workflow.issueNumber}: pushing ${afterCommit.ahead} commit(s) to ${workflow.branchName}.`,
       ),
     );
-    await git.raw(["push", "origin", workflow.branchName]);
+    await pushWithOptionalGitHubToken(git, ["origin", workflow.branchName]);
+  }
+}
+
+async function pushWithOptionalGitHubToken(
+  git: SimpleGit,
+  args: readonly string[],
+): Promise<string> {
+  const token = process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return git.raw(["push", ...args]);
+  }
+
+  const remoteIndex = args.indexOf("origin");
+  const remoteUrl =
+    remoteIndex >= 0 ? await getAuthenticatedOriginRemoteUrl(git, token) : null;
+
+  if (!remoteUrl) {
+    return git.raw(["push", ...args]);
+  }
+
+  return git.raw([
+    "push",
+    ...args.slice(0, remoteIndex),
+    remoteUrl,
+    ...args.slice(remoteIndex + 1),
+  ]);
+}
+
+async function getAuthenticatedOriginRemoteUrl(
+  git: SimpleGit,
+  token: string,
+): Promise<string | null> {
+  try {
+    const remoteUrl = await git.remote(["get-url", "origin"]);
+
+    if (typeof remoteUrl !== "string") {
+      return null;
+    }
+
+    return authenticatedGitHubRemoteUrl(
+      remoteUrl.trim(),
+      token,
+    );
+  } catch {
+    return null;
+  }
+}
+
+function authenticatedGitHubRemoteUrl(
+  remoteUrl: string,
+  token: string,
+): string | null {
+  const encodedToken = encodeURIComponent(token);
+  const sshMatch = remoteUrl.match(
+    /^git@github\.com:(?<owner>[^/]+)\/(?<repo>[^/]+?)(?:\.git)?$/,
+  );
+
+  if (sshMatch?.groups) {
+    return `https://x-access-token:${encodedToken}@github.com/${sshMatch.groups.owner}/${sshMatch.groups.repo}.git`;
+  }
+
+  try {
+    const url = new URL(remoteUrl);
+
+    if (url.hostname !== "github.com") {
+      return null;
+    }
+
+    url.username = "x-access-token";
+    url.password = encodedToken;
+
+    return url.toString();
+  } catch {
+    return null;
   }
 }
 
@@ -972,6 +1525,12 @@ function closeCodexHandoff(issueId: number): void {
   handoff.close();
 }
 
+function closeAllCodexHandoffs(): void {
+  for (const issueId of activeCodexHandoffs.keys()) {
+    closeCodexHandoff(issueId);
+  }
+}
+
 async function cleanupClosedWorkflow(
   project: AGSCProject,
   workflow: AGSCTrackedWorkflow,
@@ -984,7 +1543,10 @@ async function cleanupClosedWorkflow(
     ),
   );
 
+  await archiveCodexWorkflowThread(workflow);
+  await deleteArchivedCodexWorkflowThread(workflow);
   closeCodexHandoff(workflow.issueId);
+  await unregisterCodexWorktreeProject(workflow);
 
   try {
     await project.git.git.raw([
@@ -997,12 +1559,198 @@ async function cleanupClosedWorkflow(
     await rm(workflow.worktreePath, { recursive: true, force: true });
   }
 
+  await removeEmptyCodexWorktreeContainer(workflow.worktreePath);
   await project.git.git.raw(["worktree", "prune"]);
-  await stateStore.removeWorkflow(workflow.issueId);
+  await codexWorkspaceRootScrubber(project.rootPath);
+  await stateStore.closeWorkflow(workflow, reason);
+}
+
+async function archiveCodexWorkflowThread(
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  if (!workflow.codexThreadId) {
+    return;
+  }
+
+  const activeHandoff = activeCodexHandoffs.get(workflow.issueId);
+  const codex = activeHandoff ?? createCodexHandoffWorkflows(workflow.worktreePath);
+
+  try {
+    await codex.archiveChat(workflow.codexThreadId);
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: Codex thread ${workflow.codexThreadId} could not be archived: ${formatError(error)}`,
+      ),
+    );
+  } finally {
+    if (!activeHandoff) {
+      codex.close();
+    }
+  }
+}
+
+async function unregisterCodexWorktreeProject(
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  try {
+    await codexWorkspaceRootUnregistrar({
+      rootPath: workflow.worktreePath,
+      threadId: workflow.codexThreadId,
+    });
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: worktree was removed, but the Codex Desktop project entry could not be removed: ${formatError(error)}`,
+      ),
+    );
+  }
+}
+
+async function deleteArchivedCodexWorkflowThread(
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  if (!workflow.codexThreadId) {
+    return;
+  }
+
+  const activeHandoff = activeCodexHandoffs.get(workflow.issueId);
+  const codex = activeHandoff ?? createCodexHandoffWorkflows(workflow.worktreePath);
+  let deletedThread = false;
+
+  try {
+    await codex.deleteChat(workflow.codexThreadId);
+    deletedThread = true;
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: archived Codex thread ${workflow.codexThreadId} could not be deleted from the local sidebar index: ${formatError(error)}`,
+      ),
+    );
+  } finally {
+    if (deletedThread) {
+      await removeCodexThreadFromLocalCatalog(workflow);
+    }
+
+    if (!activeHandoff) {
+      codex.close();
+    }
+  }
+}
+
+export async function scrubStaleCodexWorktreeProjects(
+  projectRootPath: string = process.cwd(),
+): Promise<string[]> {
+  try {
+    const removedRoots = await scrubCodexWorkspaceRoots({
+      rootPathPrefix: resolveCodexWorktreesRoot(),
+    });
+    const catalogEntries = await scrubCodexLocalThreadCatalog({
+      rootPathPrefix: resolveCodexWorktreesRoot(),
+    });
+    const threadReferences = await scrubCodexThreadWorkspaceReferences({
+      rootPathPrefix: resolveCodexWorktreesRoot(),
+      replacementRootPath: projectRootPath,
+    });
+    await deleteArchivedCodexThreadsFromSidebarIndex(
+      projectRootPath,
+      threadReferences.archivedThreadIds,
+    );
+
+    return [
+      ...new Set([
+        ...removedRoots,
+        ...catalogEntries.removedRoots,
+        ...threadReferences.removedRoots,
+      ]),
+    ];
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Codex Desktop stale worktree project scrub failed: ${formatError(error)}`,
+      ),
+    );
+    return [];
+  }
+}
+
+async function deleteArchivedCodexThreadsFromSidebarIndex(
+  projectRootPath: string,
+  threadIds: readonly string[],
+): Promise<void> {
+  const uniqueThreadIds = [...new Set(threadIds)].filter(Boolean);
+
+  if (uniqueThreadIds.length === 0) {
+    return;
+  }
+
+  const codex = createCodexHandoffWorkflows(projectRootPath);
+
+  try {
+    for (const threadId of uniqueThreadIds) {
+      try {
+        await codex.deleteChat(threadId);
+      } catch (error) {
+        console.log(
+          warning(
+            `[agsc] Codex Desktop stale archived thread ${threadId} could not be deleted from the local sidebar index: ${formatError(error)}`,
+          ),
+        );
+      }
+    }
+  } finally {
+    codex.close();
+  }
+}
+
+async function removeEmptyCodexWorktreeContainer(
+  worktreePath: string,
+): Promise<void> {
+  const codexWorktreesRoot = resolveCodexWorktreesRoot();
+  const normalizedWorktreePath = resolve(worktreePath);
+  const pathWithinCodexWorktrees = relative(
+    codexWorktreesRoot,
+    normalizedWorktreePath,
+  );
+
+  if (
+    !pathWithinCodexWorktrees ||
+    pathWithinCodexWorktrees.startsWith("..") ||
+    isAbsolute(pathWithinCodexWorktrees)
+  ) {
+    return;
+  }
+
+  const containerPath = dirname(normalizedWorktreePath);
+
+  if (containerPath === codexWorktreesRoot) {
+    return;
+  }
+
+  try {
+    await rmdir(containerPath);
+  } catch (error) {
+    if (
+      isNodeError(error) &&
+      (error.code === "ENOENT" || error.code === "ENOTEMPTY")
+    ) {
+      return;
+    }
+
+    throw error;
+  }
 }
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildCodexHandoffInstructions(
@@ -1038,7 +1786,163 @@ function buildCodexHandoffInstructions(
 }
 
 function createCodexHandoffWorkflows(projectRootPath: string): CodexWorkflows {
-  return new CodexWorkflows(projectRootPath, CODEX_HANDOFF_OPTIONS);
+  return codexHandoffWorkflowFactory(projectRootPath);
+}
+
+async function registerCodexWorktreeProject(
+  project: AGSCProject,
+  workflow: AGSCTrackedWorkflow,
+  threadId: string | undefined,
+  title: string,
+): Promise<void> {
+  try {
+    await codexWorkspaceRootRegistrar({
+      rootPath: workflow.worktreePath,
+      parentRootPath: project.rootPath,
+      label: title,
+      threadId,
+    });
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: Codex thread was created, but the worktree could not be registered in the Codex sidebar: ${formatError(error)}`,
+      ),
+    );
+  }
+}
+
+async function registerCodexThreadInLocalCatalog(
+  threadId: string,
+  title: string,
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  try {
+    await upsertCodexLocalThreadCatalogEntry({
+      threadId,
+      title,
+      cwd: workflow.worktreePath,
+      sourceKind: "vscode",
+      sourceDetail: "agse-pr-worktree",
+      gitBranch: workflow.branchName,
+    });
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: Codex thread ${threadId} was created, but the local Desktop thread catalog could not be updated: ${formatError(error)}`,
+      ),
+    );
+  }
+}
+
+async function removeCodexThreadFromLocalCatalog(
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  if (!workflow.codexThreadId) {
+    return;
+  }
+
+  try {
+    await removeCodexLocalThreadCatalogEntries({
+      threadIds: [workflow.codexThreadId],
+    });
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: Codex thread ${workflow.codexThreadId} was deleted, but the local Desktop thread catalog could not be pruned: ${formatError(error)}`,
+      ),
+    );
+  }
+}
+
+async function verifyCodexThreadIsDiscoverable(
+  codex: CodexWorkflows,
+  workflow: AGSCTrackedWorkflow,
+  threadId: string,
+): Promise<void> {
+  try {
+    for (let attempt = 1; attempt <= 30; attempt += 1) {
+      const list = await codex.listChats({
+        cwd: workflow.worktreePath,
+        sourceKinds: [],
+        archived: false,
+        limit: 50,
+      });
+
+      if (extractCodexThreadIds(list).has(threadId)) {
+        return;
+      }
+
+      try {
+        const read = await codex.readChat(threadId, { includeTurns: false });
+        if (read.thread.id === threadId) {
+          return;
+        }
+      } catch {
+        // The Desktop app-server can lag briefly after background thread creation.
+      }
+
+      if (attempt < 30) {
+        await sleep(1_000);
+      }
+    }
+
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: Codex thread ${threadId} was created but did not appear in thread/list for ${workflow.worktreePath}.`,
+      ),
+    );
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Issue #${workflow.issueNumber}: could not verify Codex sidebar discoverability for thread ${threadId}: ${formatError(error)}`,
+      ),
+    );
+  }
+}
+
+function setCodexHandoffWorkflowFactory(
+  factory: (projectRootPath: string) => CodexWorkflows,
+): () => void {
+  const previousFactory = codexHandoffWorkflowFactory;
+  codexHandoffWorkflowFactory = factory;
+
+  return () => {
+    closeAllCodexHandoffs();
+    codexHandoffWorkflowFactory = previousFactory;
+  };
+}
+
+function setCodexWorkspaceRootRegistrar(
+  registrar: CodexWorkspaceRootRegistrar,
+): () => void {
+  const previousRegistrar = codexWorkspaceRootRegistrar;
+  codexWorkspaceRootRegistrar = registrar;
+
+  return () => {
+    codexWorkspaceRootRegistrar = previousRegistrar;
+  };
+}
+
+function setCodexWorkspaceRootUnregistrar(
+  unregistrar: CodexWorkspaceRootUnregistrar,
+): () => void {
+  const previousUnregistrar = codexWorkspaceRootUnregistrar;
+  codexWorkspaceRootUnregistrar = unregistrar;
+
+  return () => {
+    codexWorkspaceRootUnregistrar = previousUnregistrar;
+  };
+}
+
+function setCodexWorkspaceRootScrubber(
+  scrubber: CodexWorkspaceRootScrubber,
+): () => void {
+  const previousScrubber = codexWorkspaceRootScrubber;
+  codexWorkspaceRootScrubber = scrubber;
+
+  return () => {
+    codexWorkspaceRootScrubber = previousScrubber;
+  };
 }
 
 function buildCodexInitialHandoffMessage(
@@ -1305,7 +2209,7 @@ async function notifyAgentAboutPullRequestUpdate(
   project: AGSCProject,
   workflow: AGSCTrackedWorkflow,
   eventSummary: string,
-): Promise<void> {
+): Promise<Partial<AGSCTrackedWorkflow>> {
   if (workflow.agent !== "codex" || !workflow.codexThreadId) {
     if (workflow.agent === "claude" && workflow.claudeSessionId) {
       const worktreeClaude = new ClaudeCodeWorkflows(project.rootPath);
@@ -1319,22 +2223,211 @@ async function notifyAgentAboutPullRequestUpdate(
       void worktreeClaude.continueChat(workflow.claudeSessionId, updateMessage);
     }
 
-    return;
+    return {};
   }
 
-  const projectCodex = createCodexHandoffWorkflows(project.rootPath);
+  const activeCodex = activeCodexHandoffs.get(workflow.issueId);
+  const projectCodex = activeCodex ?? createCodexHandoffWorkflows(workflow.worktreePath);
+  const message = buildCodexPullRequestUpdateMessage(eventSummary);
+  let keepCodexOpen = Boolean(activeCodex);
 
   try {
     await projectCodex.resumeChat(workflow.codexThreadId);
-    await runCodexPullRequestUpdateUntilGitSettles({
-      workflow,
-      issueNumber: workflow.issueNumber,
-      codex: projectCodex,
+
+    if (workflow.codexActiveTurnId) {
+      try {
+        await projectCodex.steerMessage(workflow.codexThreadId, message, {
+          expectedTurnId: workflow.codexActiveTurnId,
+        });
+        return {};
+      } catch (error) {
+        if (!isRecoverableCodexSteerError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    const followUp = await projectCodex.startTurnDetached({
       threadId: workflow.codexThreadId,
-      message: buildCodexPullRequestUpdateMessage(eventSummary),
+      input: message,
+      cwd: workflow.worktreePath,
+      runtimeWorkspaceRoots: [workflow.worktreePath],
+      sandbox: CODEX_HANDOFF_OPTIONS.sandbox,
+      approvalPolicy: CODEX_HANDOFF_OPTIONS.approvalPolicy,
     });
+    activeCodexHandoffs.set(workflow.issueId, projectCodex);
+    keepCodexOpen = true;
+
+    return {
+      codexActiveTurnId: followUp.turnId,
+      agentHandoffPhase: "implementing",
+    };
   } finally {
-    projectCodex.close();
+    if (!keepCodexOpen) {
+      projectCodex.close();
+    }
+  }
+}
+
+async function syncCodexImplementationStatus(
+  project: AGSCProject,
+  repository: GitHubRepositoryRef,
+  workflow: AGSCTrackedWorkflow,
+  github: GitHubApiClient,
+): Promise<AGSCTrackedWorkflow> {
+  if (
+    workflow.agent !== "codex" ||
+    !workflow.codexThreadId ||
+    !workflow.codexActiveTurnId
+  ) {
+    return workflow;
+  }
+
+  const activeCodex = activeCodexHandoffs.get(workflow.issueId);
+  const projectCodex = activeCodex ?? createCodexHandoffWorkflows(workflow.worktreePath);
+  let keepCodexOpen = Boolean(activeCodex);
+
+  try {
+    const thread = await projectCodex.readChat(workflow.codexThreadId, {
+      includeTurns: true,
+    });
+    const turnStatus = extractTurnStatus(thread.raw, workflow.codexActiveTurnId);
+
+    if (turnStatus && terminalCodexTurnStatuses.has(turnStatus)) {
+      const gitState = await inspectCodexHandoffGitState(workflow);
+      const recovery = await projectCodex.startTurnDetached({
+        threadId: workflow.codexThreadId,
+        input: buildCodexContinuationMessage(
+          {
+            number: workflow.issueNumber,
+            title: workflow.issueTitle,
+          } as GitHubIssue,
+          workflow,
+          gitState,
+        ),
+        cwd: workflow.worktreePath,
+        runtimeWorkspaceRoots: [workflow.worktreePath],
+        sandbox: CODEX_HANDOFF_OPTIONS.sandbox,
+        approvalPolicy: CODEX_HANDOFF_OPTIONS.approvalPolicy,
+      });
+      const nextWorkflow: AGSCTrackedWorkflow = {
+        ...workflow,
+        codexActiveTurnId: recovery.turnId,
+        agentHandoffPhase: recovery.turnId ? "implementing" : "idle",
+      };
+
+      if (recovery.turnId) {
+        activeCodexHandoffs.set(workflow.issueId, projectCodex);
+        keepCodexOpen = true;
+      }
+
+      await new AGSCStateStore(project.rootPath).upsertWorkflow(nextWorkflow);
+      console.log(
+        warning(
+          `[agsc] ${project.name} #${workflow.issueNumber}: Codex turn ${workflow.codexActiveTurnId} ended as ${turnStatus}; started recovery turn ${recovery.turnId ?? "unknown"}.`,
+        ),
+      );
+      return nextWorkflow;
+    }
+
+    if (turnStatus !== "completed") {
+      return workflow;
+    }
+
+    await finalizeCodexWorktreeChanges(
+      workflow,
+      buildCodexAutoCommitMessage(workflow, "handoff"),
+    );
+    const gitState = await inspectCodexHandoffGitState(workflow);
+
+    if (gitState.needsContinuation) {
+      const recovery = await projectCodex.startTurnDetached({
+        threadId: workflow.codexThreadId,
+        input: buildCodexContinuationMessage(
+          {
+            number: workflow.issueNumber,
+            title: workflow.issueTitle,
+          } as GitHubIssue,
+          workflow,
+          gitState,
+        ),
+        cwd: workflow.worktreePath,
+        runtimeWorkspaceRoots: [workflow.worktreePath],
+        sandbox: CODEX_HANDOFF_OPTIONS.sandbox,
+        approvalPolicy: CODEX_HANDOFF_OPTIONS.approvalPolicy,
+      });
+      const nextWorkflow: AGSCTrackedWorkflow = {
+        ...workflow,
+        codexActiveTurnId: recovery.turnId,
+        agentHandoffPhase: recovery.turnId ? "implementing" : "idle",
+      };
+
+      if (recovery.turnId) {
+        activeCodexHandoffs.set(workflow.issueId, projectCodex);
+        keepCodexOpen = true;
+      }
+
+      await new AGSCStateStore(project.rootPath).upsertWorkflow(nextWorkflow);
+      console.log(
+        warning(
+          `[agsc] ${project.name} #${workflow.issueNumber}: Codex turn completed but PR branch is not finished: ${gitState.summary}. Started recovery turn ${recovery.turnId ?? "unknown"}.`,
+        ),
+      );
+      return nextWorkflow;
+    }
+
+    let nextWorkflow: AGSCTrackedWorkflow = {
+      ...workflow,
+      codexActiveTurnId: undefined,
+      codexImplementationCompletedAt:
+        workflow.codexImplementationCompletedAt ?? new Date().toISOString(),
+      agentHandoffPhase: "idle",
+    };
+
+    if (workflow.pullNumber) {
+      const pullRequest = await github.getPullRequest(
+        repository,
+        workflow.pullNumber,
+      );
+      await github.updatePullRequestBody(
+        repository,
+        workflow.pullNumber,
+        withPullRequestMetadata(
+          stripPullRequestMetadata(pullRequest.body),
+          buildPullRequestMetadataFromWorkflow(nextWorkflow),
+        ),
+      );
+    }
+
+    if (!workflow.codexImplementationCommentedAt && workflow.pullNumber) {
+      await github.addIssueComment(
+        repository,
+        workflow.pullNumber,
+        buildImplementationCompleteComment(workflow),
+      );
+      nextWorkflow = {
+        ...nextWorkflow,
+        codexImplementationCommentedAt: new Date().toISOString(),
+      };
+    }
+
+    await new AGSCStateStore(project.rootPath).upsertWorkflow(nextWorkflow);
+    if (activeCodex) {
+      closeCodexHandoff(workflow.issueId);
+      keepCodexOpen = true;
+    }
+    return nextWorkflow;
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] ${project.name} #${workflow.issueNumber}: failed to inspect Codex turn ${workflow.codexActiveTurnId}: ${formatError(error)}`,
+      ),
+    );
+    return workflow;
+  } finally {
+    if (!keepCodexOpen) {
+      projectCodex.close();
+    }
   }
 }
 
@@ -1342,31 +2435,84 @@ async function buildPullRequestEventSummary(
   github: GitHubApiClient,
   repository: GitHubRepositoryRef,
   workflow: AGSCTrackedWorkflow,
-): Promise<string | null> {
+): Promise<PullRequestEventSummary | null> {
   const [comments, reviews] = await Promise.all([
     github.listIssueComments(repository, workflow.pullNumber ?? 0),
     github.listPullRequestReviews(repository, workflow.pullNumber ?? 0),
   ]);
-  const pieces = [
-    ...comments.map((comment) =>
-      [
-        `Comment by ${comment.user?.login ?? "unknown"} at ${comment.updated_at}:`,
-        comment.body ?? "",
-        comment.html_url,
-      ].join("\n"),
-    ),
+  const synced = new Set(workflow.syncedPrEventIds ?? []);
+  const events = [
+    ...comments
+      .filter((comment) => !isAGSCComment(comment.body))
+      .map((comment) => ({
+        id: `comment:${comment.id}`,
+        commentId: comment.id,
+        updatedAt: comment.updated_at,
+        summary: formatPullRequestComment(comment),
+      })),
     ...reviews
       .filter((review) => review.body)
-      .map((review) =>
-        [
-          `Review ${review.state} by ${review.user?.login ?? "unknown"} at ${review.submitted_at ?? "unknown"}:`,
-          review.body ?? "",
-          review.html_url,
-        ].join("\n"),
-      ),
-  ];
+      .map((review) => ({
+        id: `review:${review.id}`,
+        commentId: undefined,
+        updatedAt: review.submitted_at ?? "",
+        summary: formatPullRequestReview(review),
+      })),
+  ]
+    .filter((event) => !synced.has(event.id))
+    .sort(
+      (left, right) =>
+        new Date(left.updatedAt).getTime() - new Date(right.updatedAt).getTime(),
+    );
 
-  return pieces.length > 0 ? pieces.join("\n\n---\n\n") : null;
+  if (events.length === 0) {
+    return null;
+  }
+
+  return {
+    summary: events.map((event) => event.summary).join("\n\n---\n\n"),
+    eventIds: events.map((event) => event.id),
+    commentIds: events
+      .map((event) => event.commentId)
+      .filter((commentId): commentId is number => typeof commentId === "number"),
+  };
+}
+
+async function acknowledgePullRequestCommentEvents(
+  github: GitHubApiClient,
+  repository: GitHubRepositoryRef,
+  commentIds: readonly number[],
+): Promise<void> {
+  for (const commentId of commentIds) {
+    await github.addIssueCommentReaction(repository, commentId, "eyes");
+  }
+}
+
+function formatPullRequestComment(comment: GitHubIssueComment): string {
+  return [
+    `Comment by ${comment.user?.login ?? "unknown"} at ${comment.updated_at}:`,
+    comment.body ?? "",
+    comment.html_url,
+  ].join("\n");
+}
+
+function formatPullRequestReview(review: GitHubPullRequestReview): string {
+  return [
+    `Review ${review.state} by ${review.user?.login ?? "unknown"} at ${review.submitted_at ?? "unknown"}:`,
+    review.body ?? "",
+    review.html_url,
+  ].join("\n");
+}
+
+function mergeSyncedEventIds(
+  current: readonly string[] | undefined,
+  next: readonly string[],
+): string[] {
+  return [...new Set([...(current ?? []), ...next])];
+}
+
+function isAGSCComment(body: string | null): boolean {
+  return Boolean(body?.includes(AGSC_IMPLEMENTATION_DONE_MARKER));
 }
 
 async function getRemoteDefaultBranch(git: SimpleGit): Promise<string> {
@@ -1380,39 +2526,86 @@ async function remoteBranchExists(
   git: SimpleGit,
   branchName: string,
 ): Promise<boolean> {
-  const output = await git.raw(["ls-remote", "--heads", "origin", branchName]);
+  const output = await lsRemoteHeadsWithOptionalGitHubToken(git, branchName);
 
   return output.trim().length > 0;
+}
+
+async function lsRemoteHeadsWithOptionalGitHubToken(
+  git: SimpleGit,
+  branchName: string,
+): Promise<string> {
+  const token = process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return git.raw(["ls-remote", "--heads", "origin", branchName]);
+  }
+
+  const remoteUrl = await getAuthenticatedOriginRemoteUrl(git, token);
+
+  return git.raw([
+    "ls-remote",
+    "--heads",
+    remoteUrl ?? "origin",
+    branchName,
+  ]);
+}
+
+async function fetchRemoteBranchWithOptionalGitHubToken(
+  git: SimpleGit,
+  branchName: string,
+): Promise<string> {
+  const token = process.env.GITHUB_TOKEN;
+  const refspec = `refs/heads/${branchName}:refs/remotes/origin/${branchName}`;
+
+  if (!token) {
+    return git.raw(["fetch", "origin", refspec]);
+  }
+
+  const remoteUrl = await getAuthenticatedOriginRemoteUrl(git, token);
+
+  return git.raw(["fetch", remoteUrl ?? "origin", refspec]);
 }
 
 function buildPullRequestTitle(issue: GitHubIssue): string {
   return `Issue #${issue.number}: ${issue.title}`;
 }
 
-function buildInitialPullRequestBody(issue: GitHubIssue): string {
-  return [
+function buildInitialPullRequestBody(
+  issue: GitHubIssue,
+  metadata?: AGSCPullRequestMetadata,
+): string {
+  const body = [
     `## Issue`,
     ``,
     `Closes #${issue.number}`,
     ``,
     issue.body?.trim() || "_No issue description provided._",
   ].join("\n");
+
+  return metadata ? withPullRequestMetadata(body, metadata) : body;
 }
 
 function buildPlanningPrompt(
   issue: GitHubIssue,
   pullRequest: GitHubPullRequest,
+  workflow: AGSCTrackedWorkflow,
 ): string {
   return [
     "You are working inside an AGSC-created Git worktree for a GitHub issue.",
-    "First summarize the issue and produce a concrete implementation plan.",
-    "Do not change files yet in this turn.",
-    "After this planning turn, AGSC will update the PR body with your plan.",
+    "This first turn is planning only. Do not edit files, commit, push, or run mutating commands.",
+    "Explore the repository with read-only commands and produce a decision-complete implementation plan.",
+    "Your final answer must contain exactly one <proposed_plan> block. AGSC will copy that block into the PR body.",
     "",
     `Issue #${issue.number}: ${issue.title}`,
+    `Issue URL: ${issue.html_url}`,
+    "",
+    "Issue description:",
     issue.body?.trim() || "_No issue description provided._",
     "",
-    `Pull request: ${pullRequest.html_url}`,
+    `Pull request #${pullRequest.number}: ${pullRequest.html_url}`,
+    `PR branch: ${workflow.branchName}`,
+    `Worktree: ${workflow.worktreePath}`,
   ].join("\n");
 }
 
@@ -1424,6 +2617,7 @@ function buildImplementationPrompt(
   return [
     "Now execute the plan for this issue in the current worktree.",
     "Make the necessary code changes, run focused verification, commit the changes, and push them to the current PR branch.",
+    "When finished, leave a concise final response that states what changed and which verification ran.",
     "Keep the PR focused on the issue.",
     "If you cannot complete part of the plan, report the blocker clearly.",
     "",
@@ -1435,6 +2629,191 @@ function buildImplementationPrompt(
     "Plan:",
     plan || "_No plan text was produced._",
   ].join("\n");
+}
+
+function buildPlannedPullRequestBody(
+  issue: GitHubIssue,
+  plan: string,
+  metadata?: AGSCPullRequestMetadata,
+): string {
+  const body = [
+    stripPullRequestMetadata(buildInitialPullRequestBody(issue)).trimEnd(),
+    "",
+    "## Codex Plan",
+    "",
+    plan.trim() || "_Codex did not produce a plan._",
+  ].join("\n");
+
+  return metadata ? withPullRequestMetadata(body, metadata) : body;
+}
+
+function buildPullRequestMetadata(
+  issue: GitHubIssue,
+  workflow: AGSCTrackedWorkflow,
+  overrides: Partial<AGSCPullRequestMetadata> = {},
+): AGSCPullRequestMetadata {
+  return compactPullRequestMetadata({
+    version: 1,
+    issueId: issue.id,
+    issueNumber: issue.number,
+    issueTitle: issue.title,
+    issueUrl: issue.html_url,
+    agent: workflow.agent,
+    branchName: workflow.branchName,
+    worktreePath: workflow.worktreePath,
+    codexThreadId: workflow.codexThreadId,
+    codexPlanningTurnId: workflow.codexPlanningTurnId,
+    codexImplementationTurnId: workflow.codexImplementationTurnId,
+    codexActiveTurnId: workflow.codexActiveTurnId,
+    agentHandoffPhase: workflow.agentHandoffPhase,
+    issueClosedByAGSCAt: workflow.issueClosedByAGSCAt,
+    ...overrides,
+  });
+}
+
+function buildPullRequestMetadataFromWorkflow(
+  workflow: AGSCTrackedWorkflow,
+  overrides: Partial<AGSCPullRequestMetadata> = {},
+): AGSCPullRequestMetadata {
+  return compactPullRequestMetadata({
+    version: 1,
+    issueId: workflow.issueId,
+    issueNumber: workflow.issueNumber,
+    issueTitle: workflow.issueTitle,
+    issueUrl: workflow.issueUrl,
+    agent: workflow.agent,
+    branchName: workflow.branchName,
+    worktreePath: workflow.worktreePath,
+    codexThreadId: workflow.codexThreadId,
+    codexPlanningTurnId: workflow.codexPlanningTurnId,
+    codexImplementationTurnId: workflow.codexImplementationTurnId,
+    codexActiveTurnId: workflow.codexActiveTurnId,
+    agentHandoffPhase: workflow.agentHandoffPhase,
+    issueClosedByAGSCAt: workflow.issueClosedByAGSCAt,
+    ...overrides,
+  });
+}
+
+function compactPullRequestMetadata(
+  metadata: AGSCPullRequestMetadata,
+): AGSCPullRequestMetadata {
+  return Object.fromEntries(
+    Object.entries(metadata).filter(([, value]) => value !== undefined),
+  ) as AGSCPullRequestMetadata;
+}
+
+function withPullRequestMetadata(
+  body: string,
+  metadata: AGSCPullRequestMetadata,
+): string {
+  return [
+    stripPullRequestMetadata(body).trimEnd(),
+    "",
+    AGSC_METADATA_OPEN,
+    JSON.stringify(metadata),
+    AGSC_METADATA_CLOSE,
+  ].join("\n");
+}
+
+function stripPullRequestMetadata(body: string | null): string {
+  if (!body) {
+    return "";
+  }
+
+  const pattern = new RegExp(
+    `\\n?${escapeRegExp(AGSC_METADATA_OPEN)}\\s*[\\s\\S]*?\\s*${escapeRegExp(AGSC_METADATA_CLOSE)}\\s*$`,
+  );
+
+  return body.replace(pattern, "").trimEnd();
+}
+
+function parsePullRequestMetadata(
+  body: string | null,
+): AGSCPullRequestMetadata | null {
+  if (!body) {
+    return null;
+  }
+
+  const pattern = new RegExp(
+    `${escapeRegExp(AGSC_METADATA_OPEN)}\\s*([\\s\\S]*?)\\s*${escapeRegExp(AGSC_METADATA_CLOSE)}`,
+  );
+  const match = body.match(pattern);
+
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(match[1] ?? "") as Partial<AGSCPullRequestMetadata>;
+
+    if (
+      parsed.version !== 1 ||
+      typeof parsed.issueNumber !== "number" ||
+      (parsed.agent !== "codex" && parsed.agent !== "claude") ||
+      typeof parsed.branchName !== "string"
+    ) {
+      return null;
+    }
+
+    return parsed as AGSCPullRequestMetadata;
+  } catch {
+    return null;
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractProposedPlan(response: string): string {
+  const match = response.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/);
+
+  return match ? match[1].trim() : response.trim();
+}
+
+function buildImplementationCompleteComment(
+  workflow: AGSCTrackedWorkflow,
+): string {
+  return [
+    AGSC_IMPLEMENTATION_DONE_MARKER,
+    `AGSC completed the Codex implementation pass for issue #${workflow.issueNumber}.`,
+    "",
+    `Codex thread: ${workflow.codexThreadId ?? "unknown"}`,
+    `Implementation turn: ${workflow.codexImplementationTurnId ?? "unknown"}`,
+  ].join("\n");
+}
+
+function extractTurnStatus(value: unknown, turnId: string): string | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  if (typeof value.id === "string" && value.id === turnId) {
+    return typeof value.status === "string" ? value.status : null;
+  }
+
+  for (const nested of Object.values(value)) {
+    if (Array.isArray(nested)) {
+      for (const entry of nested) {
+        const status = extractTurnStatus(entry, turnId);
+
+        if (status) {
+          return status;
+        }
+      }
+      continue;
+    }
+
+    if (isRecord(nested)) {
+      const status = extractTurnStatus(nested, turnId);
+
+      if (status) {
+        return status;
+      }
+    }
+  }
+
+  return null;
 }
 
 function slugify(value: string): string {
@@ -1463,17 +2842,40 @@ export const __testing = {
   buildCodexPullRequestUpdateGitState,
   buildCodexPullRequestUpdateMessage,
   buildCodexAutoCommitMessage,
+  buildImplementationCompleteComment,
+  buildPullRequestMetadata,
+  buildPullRequestMetadataFromWorkflow,
   CODEX_HANDOFF_PROMPT_VERSION,
   CODEX_HANDOFF_OPTIONS,
   createCodexHandoffWorkflows,
+  setCodexHandoffWorkflowFactory,
+  closeAllCodexHandoffs,
+  setCodexWorkspaceRootRegistrar,
+  setCodexWorkspaceRootUnregistrar,
+  setCodexWorkspaceRootScrubber,
+  buildPlannedPullRequestBody,
+  buildPlanningPrompt,
+  buildImplementationPrompt,
   buildInitialPullRequestBody,
   buildIssueBranchName,
   buildIssueWorktreePath,
+  buildLegacyIssueWorktreePath,
+  resolveCodexWorktreesRoot,
+  scrubStaleCodexWorktreeProjects,
   buildPullRequestTitle,
+  extractProposedPlan,
+  extractTurnStatus,
+  parsePullRequestMetadata,
+  stripPullRequestMetadata,
+  withPullRequestMetadata,
+  formatPullRequestComment,
+  formatPullRequestReview,
   extractCodexThreadIds,
   extractNotificationTurnId,
   findRegisteredWorktree,
   isLocalIssue,
+  isAGSCComment,
+  mergeSyncedEventIds,
   isRecoverableCodexSteerError,
   selectAgent,
   slugify,

@@ -1,6 +1,12 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  spawn,
+  spawnSync,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { EventEmitter } from "node:events";
+import { connect as connectSocket } from "node:net";
 import { createInterface, type Interface } from "node:readline";
+import WebSocket from "ws";
 
 export type CodexJson =
   | null
@@ -35,6 +41,27 @@ export type CodexAppServerOptions = {
    * Extra args appended after "app-server".
    */
   appServerArgs?: readonly string[];
+  /**
+   * Connect through the durable local Codex app-server daemon instead of owning
+   * a private stdio server process. This lets AGSE hand threads off to the
+   * desktop app and disconnect without killing in-flight turns.
+   */
+  useDaemonProxy?: boolean;
+  /**
+   * Start the daemon through `codex remote-control start` before proxying to it.
+   * This is the background path Codex uses for device/app-owned work that should
+   * not require opening or scripting the visible desktop UI.
+   */
+  useRemoteControlDaemon?: boolean;
+  /**
+   * Fail instead of falling back to a private stdio app-server when the durable
+   * daemon proxy is requested but unavailable.
+   */
+  requireDaemonProxy?: boolean;
+  /**
+   * Unix socket used by the managed app-server daemon control plane.
+   */
+  daemonSocketPath?: string;
 };
 
 export type CodexNotification = {
@@ -71,6 +98,8 @@ export class CodexAppServerClient {
 
   private process?: ChildProcessWithoutNullStreams;
   private stdout?: Interface;
+  private socket?: WebSocket;
+  private transportReadyPromise: Promise<void> = Promise.resolve();
   private nextRequestId = 0;
   private initializePromise?: Promise<unknown>;
   private closed = false;
@@ -85,7 +114,7 @@ export class CodexAppServerClient {
     }
 
     this.startProcess();
-    this.initializePromise = this.initialize();
+    this.initializePromise = this.transportReadyPromise.then(() => this.initialize());
 
     return this.initializePromise;
   }
@@ -130,6 +159,7 @@ export class CodexAppServerClient {
       this.process.kill();
     }
 
+    this.socket?.close();
     this.rejectPendingRequests(new Error("Codex app-server client closed."));
   }
 
@@ -139,6 +169,48 @@ export class CodexAppServerClient {
     }
 
     const binary = this.options.codexBinary ?? "codex";
+    let useDaemonProxy = Boolean(this.options.useDaemonProxy);
+
+    if (useDaemonProxy) {
+      const daemonStartArgs = this.options.useRemoteControlDaemon
+        ? ["remote-control", "start", "--json"]
+        : ["app-server", "daemon", "start"];
+      const started = spawnSync(binary, daemonStartArgs, {
+        cwd: this.options.cwd,
+        encoding: "utf8",
+        env: this.options.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      if (started.error || started.status !== 0) {
+        const daemonKind = this.options.useRemoteControlDaemon
+          ? "remote-control daemon"
+          : "app-server daemon";
+        const reason = formatDaemonStartFailure({
+          daemonKind,
+          error: started.error,
+          status: started.status,
+          stderr: started.stderr,
+          stdout: started.stdout,
+        });
+
+        if (this.options.requireDaemonProxy) {
+          throw new Error(`${reason} AGSE requires a durable background Codex ${daemonKind} for PR workflow handoff; refusing to create a hidden private-stdio chat or open the Codex Desktop UI.`);
+        }
+
+        useDaemonProxy = false;
+        this.emitter.emit(
+          "stderr",
+          `${reason} Falling back to stdio.`,
+        );
+      }
+    }
+
+    if (useDaemonProxy) {
+      this.startDaemonSocketTransport();
+      return;
+    }
+
     const args = ["app-server", ...(this.options.appServerArgs ?? [])];
     const child = spawn(binary, args, {
       cwd: this.options.cwd,
@@ -166,6 +238,42 @@ export class CodexAppServerClient {
         ? `Codex app-server exited with signal ${signal}.`
         : `Codex app-server exited with code ${code ?? "unknown"}.`;
       const error = new Error(reason);
+      this.rejectPendingRequests(error);
+      this.emitError(error);
+    });
+  }
+
+  private startDaemonSocketTransport(): void {
+    const socketPath =
+      this.options.daemonSocketPath ??
+      `${resolveCodexHome(this.options.env)}/app-server-control/app-server-control.sock`;
+    const socket = new WebSocket("ws://localhost/", {
+      createConnection: () => connectSocket(socketPath),
+      perMessageDeflate: false,
+    });
+
+    this.socket = socket;
+    this.transportReadyPromise = new Promise<void>((resolve, reject) => {
+      socket.once("open", resolve);
+      socket.once("error", reject);
+    });
+
+    socket.on("message", (data) => {
+      this.handleLine(data.toString());
+    });
+    socket.on("error", (error) => {
+      this.rejectPendingRequests(error);
+      this.emitError(error);
+    });
+    socket.on("close", (code, reason) => {
+      if (this.closed) {
+        return;
+      }
+
+      const reasonText = reason.toString();
+      const error = new Error(
+        `Codex app-server daemon socket closed with code ${code}${reasonText ? `: ${reasonText}` : ""}.`,
+      );
       this.rejectPendingRequests(error);
       this.emitError(error);
     });
@@ -223,6 +331,15 @@ export class CodexAppServerClient {
   }
 
   private send(message: CodexJsonObject): void {
+    if (this.socket) {
+      if (this.socket.readyState !== WebSocket.OPEN) {
+        throw new Error("Codex app-server daemon socket is not open.");
+      }
+
+      this.socket.send(JSON.stringify(message));
+      return;
+    }
+
     if (!this.process?.stdin.writable) {
       throw new Error("Codex app-server stdin is not writable.");
     }
@@ -290,6 +407,47 @@ export class CodexAppServerClient {
   private emitError(error: Error): void {
     this.emitter.emit("clientError", error);
   }
+}
+
+function resolveCodexHome(env?: NodeJS.ProcessEnv): string {
+  return (
+    env?.CODEX_HOME?.trim() ||
+    process.env.CODEX_HOME?.trim() ||
+    `${process.env.HOME}/.codex`
+  );
+}
+
+function formatDaemonStartFailure({
+  daemonKind,
+  error,
+  status,
+  stderr,
+  stdout,
+}: {
+  daemonKind: string;
+  error?: Error;
+  status: number | null;
+  stderr?: string | Buffer | null;
+  stdout?: string | Buffer | null;
+}): string {
+  if (error) {
+    return `Codex ${daemonKind} unavailable: ${error.message}.`;
+  }
+
+  const output = [stderr, stdout]
+    .map((value) => value?.toString().trim())
+    .filter((value): value is string => Boolean(value))
+    .join("\n")
+    .trim();
+  const suffix = output ? ` ${truncateOutput(output)}` : "";
+  return `Codex ${daemonKind} start failed with code ${status ?? "unknown"}.${suffix}`;
+}
+
+function truncateOutput(output: string): string {
+  const limit = 2_000;
+  return output.length <= limit
+    ? output
+    : `${output.slice(0, limit)}...`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

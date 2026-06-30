@@ -1,6 +1,7 @@
 import type { AGSCProject, AGSCWorkspace } from "./agscWorkspace.ts";
 import {
   handleGitHubIssueForProject,
+  recoverTrackedPullRequests,
   syncTrackedPullRequests,
 } from "./agscIssueAutomation.ts";
 import {
@@ -139,14 +140,20 @@ export class GitHubIssuePoller {
           `[github] Polling ${state.project.name} (${state.repository.owner}/${state.repository.repo})...`,
         ),
       );
+      await recoverTrackedPullRequests(
+        state.project,
+        state.repository,
+        this.github,
+      );
       await syncTrackedPullRequests(state.project, state.repository, this.github);
 
       const issues = await this.github.listRecentIssues(state.repository);
+      const openIssueCount = countIssuesOnly(issues);
       const pendingIssues = await this.selectPendingIssues(issues, state);
 
       console.log(
         info(
-          `[github] ${state.project.name}: saw ${issues.length} open issue(s), ${pendingIssues.length} pending AGSC check(s).`,
+          `[github] ${state.project.name}: saw ${openIssueCount} open issue(s), ${pendingIssues.length} pending AGSC check(s).`,
         ),
       );
 
@@ -187,16 +194,19 @@ export class GitHubIssuePoller {
     issues: GitHubIssue[],
     state: ProjectIssuePollState,
   ): Promise<GitHubIssue[]> {
+    const agscState = await new AGSCStateStore(state.project.rootPath).read();
     const trackedIssueIds = new Set(
-      (await new AGSCStateStore(state.project.rootPath).read()).workflows.map(
-        (workflow) => workflow.issueId,
-      ),
+      agscState.workflows.map((workflow) => workflow.issueId),
+    );
+    const closedWorkflowIssueIds = new Set(
+      agscState.closedWorkflows.map((workflow) => workflow.issueId),
     );
 
     return selectPendingIssuesForAutomation(
       issues,
       state.seenIssueIds,
       trackedIssueIds,
+      closedWorkflowIssueIds,
     );
   }
 }
@@ -205,18 +215,29 @@ function selectPendingIssuesForAutomation(
   issues: readonly GitHubIssue[],
   seenIssueIds: ReadonlySet<number>,
   trackedIssueIds: ReadonlySet<number>,
+  closedWorkflowIssueIds: ReadonlySet<number> = new Set(),
 ): GitHubIssue[] {
   return issues
-    .filter((issue) => !issue.pull_request)
+    .filter(isIssueOnly)
     .filter(
       (issue) =>
-        !seenIssueIds.has(issue.id) && !trackedIssueIds.has(issue.id),
+        !seenIssueIds.has(issue.id) &&
+        !trackedIssueIds.has(issue.id) &&
+        !closedWorkflowIssueIds.has(issue.id),
     )
     .sort(
       (left, right) =>
         new Date(left.created_at).getTime() -
         new Date(right.created_at).getTime(),
     );
+}
+
+function countIssuesOnly(issues: readonly GitHubIssue[]): number {
+  return issues.filter(isIssueOnly).length;
+}
+
+function isIssueOnly(issue: GitHubIssue): boolean {
+  return !issue.pull_request;
 }
 
 async function getLocalGitHubUser(
@@ -267,5 +288,6 @@ function formatError(error: unknown): string {
 }
 
 export const __testing = {
+  countIssuesOnly,
   selectPendingIssuesForAutomation,
 };

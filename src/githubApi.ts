@@ -61,12 +61,21 @@ export type GitHubPullRequestReview = {
   user?: GitHubUser;
 };
 
+export type GitHubReactionContent = "eyes";
+
 export type CreatePullRequestInput = {
   title: string;
   body: string;
   head: string;
   base: string;
   draft?: boolean;
+};
+
+export type CreateIssueInput = {
+  title: string;
+  body?: string;
+  labels?: string[];
+  assignees?: string[];
 };
 
 export class GitHubApiClient {
@@ -106,6 +115,30 @@ export class GitHubApiClient {
     );
   }
 
+  async createIssue(
+    repository: GitHubRepositoryRef,
+    input: CreateIssueInput,
+  ): Promise<GitHubIssue> {
+    return this.request<GitHubIssue>(this.repoUrl(repository, "issues"), {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updateIssue(
+    repository: GitHubRepositoryRef,
+    issueNumber: number,
+    input: Partial<Pick<GitHubIssue, "state" | "title" | "body">>,
+  ): Promise<GitHubIssue> {
+    return this.request<GitHubIssue>(
+      this.repoUrl(repository, `issues/${issueNumber}`),
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      },
+    );
+  }
+
   async listOpenPullRequestsForHead(
     repository: GitHubRepositoryRef,
     headBranch: string,
@@ -114,6 +147,19 @@ export class GitHubApiClient {
 
     url.searchParams.set("state", "open");
     url.searchParams.set("head", `${repository.owner}:${headBranch}`);
+
+    return this.request<GitHubPullRequest[]>(url);
+  }
+
+  async listOpenPullRequests(
+    repository: GitHubRepositoryRef,
+  ): Promise<GitHubPullRequest[]> {
+    const url = this.repoUrl(repository, "pulls");
+
+    url.searchParams.set("state", "open");
+    url.searchParams.set("sort", "updated");
+    url.searchParams.set("direction", "desc");
+    url.searchParams.set("per_page", "100");
 
     return this.request<GitHubPullRequest[]>(url);
   }
@@ -147,6 +193,62 @@ export class GitHubApiClient {
       {
         method: "PATCH",
         body: JSON.stringify({ body }),
+      },
+    );
+  }
+
+  async addIssueComment(
+    repository: GitHubRepositoryRef,
+    issueNumber: number,
+    body: string,
+  ): Promise<GitHubIssueComment> {
+    return this.request<GitHubIssueComment>(
+      this.repoUrl(repository, `issues/${issueNumber}/comments`),
+      {
+        method: "POST",
+        body: JSON.stringify({ body }),
+      },
+    );
+  }
+
+  async addIssueCommentReaction(
+    repository: GitHubRepositoryRef,
+    commentId: number,
+    content: GitHubReactionContent,
+  ): Promise<void> {
+    await this.request<void>(
+      this.repoUrl(repository, `issues/comments/${commentId}/reactions`),
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/vnd.github+json",
+        },
+        body: JSON.stringify({ content }),
+      },
+    );
+  }
+
+  async closePullRequest(
+    repository: GitHubRepositoryRef,
+    pullNumber: number,
+  ): Promise<GitHubPullRequest> {
+    return this.request<GitHubPullRequest>(
+      this.repoUrl(repository, `pulls/${pullNumber}`),
+      {
+        method: "PATCH",
+        body: JSON.stringify({ state: "closed" }),
+      },
+    );
+  }
+
+  async deleteBranchRef(
+    repository: GitHubRepositoryRef,
+    branchName: string,
+  ): Promise<void> {
+    await this.request<void>(
+      this.repoUrl(repository, `git/refs/heads/${branchName}`),
+      {
+        method: "DELETE",
       },
     );
   }
@@ -194,6 +296,10 @@ export class GitHubApiClient {
       throw new Error(
         `GitHub API returned ${response.status} ${response.statusText}`,
       );
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
     }
 
     return (await response.json()) as T;

@@ -54,7 +54,15 @@ console.log(followUp.finalResponse);
 codex.close();
 ```
 
-The integration starts `codex app-server` over stdio. If `codex` is not on `PATH`, or if you need a pinned runtime, pass `codexBinary` in the workflow options or in `agse.config.ts`.
+The low-level helpers can start `codex app-server` over stdio for direct calls.
+AGSE PR/worktree handoffs require the durable background Codex daemon instead:
+they set `useDaemonProxy`, `useRemoteControlDaemon`, and `requireDaemonProxy`
+so AGSE never creates a hidden private-stdio chat and never opens or scripts the
+visible Codex Desktop UI as a fallback. If the daemon is unavailable, the handoff
+fails clearly.
+
+If `codex` is not on `PATH`, or if you need a pinned runtime, pass `codexBinary`
+in the workflow options or in `agse.config.ts`.
 
 ```ts
 const config = {

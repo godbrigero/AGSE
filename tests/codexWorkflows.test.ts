@@ -82,3 +82,38 @@ test("withoutTimeout strips timeout from turn parameters", () => {
     },
   );
 });
+
+test("buildTurnParams maps legacy sandbox mode to current sandboxPolicy", () => {
+  assert.deepEqual(
+    codex.buildTurnParams({
+      threadId: "thread-1",
+      input: "hello",
+      cwd: "/repo",
+      sandbox: "danger-full-access",
+      approvalPolicy: "never",
+      timeoutMs: 1000,
+    }),
+    {
+      threadId: "thread-1",
+      input: "hello",
+      cwd: "/repo",
+      sandboxPolicy: { type: "dangerFullAccess" },
+      approvalPolicy: "never",
+    },
+  );
+});
+
+test("sandboxPolicyFromMode supports read-only and workspace-write modes", () => {
+  assert.deepEqual(codex.sandboxPolicyFromMode("read-only"), {
+    type: "readOnly",
+    networkAccess: true,
+  });
+  assert.deepEqual(codex.sandboxPolicyFromMode("workspace-write"), {
+    type: "workspaceWrite",
+    writableRoots: [],
+    networkAccess: true,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  });
+  assert.equal(codex.sandboxPolicyFromMode("custom"), undefined);
+});

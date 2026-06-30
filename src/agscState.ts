@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export type AGSCAgentName = "codex" | "claude";
@@ -15,15 +15,39 @@ export type AGSCTrackedWorkflow = {
   pullUrl?: string;
   pullState?: "open" | "closed";
   codexThreadId?: string;
+  codexPlanningTurnId?: string;
+  codexImplementationTurnId?: string;
+  codexActiveTurnId?: string;
+  codexLastPlan?: string;
+  codexImplementationStartedAt?: string;
+  codexImplementationCompletedAt?: string;
+  codexImplementationCommentedAt?: string;
   claudeSessionId?: string;
   agentHandoffStartedAt?: string;
   agentHandoffVersion?: number;
+  agentHandoffPhase?: "planning" | "implementing" | "idle";
   lastPullUpdatedAt?: string;
   lastSyncedPrEventAt?: string;
+  syncedPrEventIds?: string[];
+  issueClosedByAGSCAt?: string;
+};
+
+export type AGSCClosedWorkflow = {
+  issueId: number;
+  issueNumber: number;
+  issueTitle?: string;
+  issueUrl?: string;
+  pullNumber?: number;
+  pullUrl?: string;
+  branchName: string;
+  worktreePath: string;
+  reason: string;
+  closedAt: string;
 };
 
 export type AGSCState = {
   workflows: AGSCTrackedWorkflow[];
+  closedWorkflows: AGSCClosedWorkflow[];
 };
 
 const STATE_FILE_PATH = ".agse/state.json";
@@ -44,10 +68,13 @@ export class AGSCStateStore {
 
       return {
         workflows: Array.isArray(state.workflows) ? state.workflows : [],
+        closedWorkflows: Array.isArray(state.closedWorkflows)
+          ? state.closedWorkflows.filter(isClosedWorkflow)
+          : [],
       };
     } catch (error) {
       if (isNodeError(error) && error.code === "ENOENT") {
-        return { workflows: [] };
+        return { workflows: [], closedWorkflows: [] };
       }
 
       throw error;
@@ -60,11 +87,13 @@ export class AGSCStateStore {
     const nextState = await updater(await this.read());
 
     await mkdir(dirname(this.statePath), { recursive: true });
+    const tempPath = `${this.statePath}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(
-      this.statePath,
+      tempPath,
       `${JSON.stringify(nextState, null, 2)}\n`,
       "utf8",
     );
+    await rename(tempPath, this.statePath);
 
     return nextState;
   }
@@ -79,6 +108,9 @@ export class AGSCStateStore {
 
       return {
         workflows: [...workflows, workflow],
+        closedWorkflows: state.closedWorkflows.filter(
+          (entry) => entry.issueId !== workflow.issueId,
+        ),
       };
     });
 
@@ -88,10 +120,56 @@ export class AGSCStateStore {
   async removeWorkflow(issueId: number): Promise<void> {
     await this.update((state) => ({
       workflows: state.workflows.filter((entry) => entry.issueId !== issueId),
+      closedWorkflows: state.closedWorkflows,
+    }));
+  }
+
+  async closeWorkflow(
+    workflow: AGSCTrackedWorkflow,
+    reason: string,
+  ): Promise<void> {
+    await this.update((state) => ({
+      workflows: state.workflows.filter(
+        (entry) => entry.issueId !== workflow.issueId,
+      ),
+      closedWorkflows: [
+        ...state.closedWorkflows.filter(
+          (entry) => entry.issueId !== workflow.issueId,
+        ),
+        {
+          issueId: workflow.issueId,
+          issueNumber: workflow.issueNumber,
+          issueTitle: workflow.issueTitle,
+          issueUrl: workflow.issueUrl,
+          pullNumber: workflow.pullNumber,
+          pullUrl: workflow.pullUrl,
+          branchName: workflow.branchName,
+          worktreePath: workflow.worktreePath,
+          reason,
+          closedAt: new Date().toISOString(),
+        },
+      ],
     }));
   }
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function isClosedWorkflow(value: unknown): value is AGSCClosedWorkflow {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const entry = value as Partial<AGSCClosedWorkflow>;
+
+  return (
+    typeof entry.issueId === "number" &&
+    typeof entry.issueNumber === "number" &&
+    typeof entry.branchName === "string" &&
+    typeof entry.worktreePath === "string" &&
+    typeof entry.reason === "string" &&
+    typeof entry.closedAt === "string"
+  );
 }

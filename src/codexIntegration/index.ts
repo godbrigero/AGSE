@@ -24,5 +24,6 @@ export {
   type SendCodexMessageInput,
   type SendCodexMessageResult,
   type StartCodexChatInput,
+  type StartCodexDetachedTurnResult,
 } from "./workflows.ts";
 export { resolveFolderRoot } from "./folderRoot.ts";

@@ -36,7 +36,7 @@ test("AGSCStateStore starts empty when no state file exists", async () => {
   await withTempProject(async (projectRootPath) => {
     const state = await new AGSCStateStore(projectRootPath).read();
 
-    assert.deepEqual(state, { workflows: [] });
+    assert.deepEqual(state, { workflows: [], closedWorkflows: [] });
   });
 });
 
@@ -72,5 +72,21 @@ test("AGSCStateStore removes closed workflow records by issue id", async () => {
       (await store.read()).workflows.map((entry) => entry.issueId),
       [2],
     );
+  });
+});
+
+test("AGSCStateStore records closed workflows as tombstones", async () => {
+  await withTempProject(async (projectRootPath) => {
+    const store = new AGSCStateStore(projectRootPath);
+    const sample = workflow(1, 1);
+
+    await store.upsertWorkflow(sample);
+    await store.closeWorkflow(sample, "PR closed");
+
+    const state = await store.read();
+    assert.deepEqual(state.workflows, []);
+    assert.equal(state.closedWorkflows.length, 1);
+    assert.equal(state.closedWorkflows[0]?.issueId, 1);
+    assert.equal(state.closedWorkflows[0]?.reason, "PR closed");
   });
 });

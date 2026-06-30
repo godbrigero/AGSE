@@ -2,11 +2,19 @@
 
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { basename, resolve } from "node:path";
+import { basename } from "node:path";
 import { Writable } from "node:stream";
 import { AGSCWorkspace } from "./agscWorkspace.ts";
+import { scrubStaleCodexWorktreeProjects } from "./agscIssueAutomation.ts";
 import { GitHubIssuePoller } from "./githubIssuePolling.ts";
 import { loadDotEnv, saveDotEnvValue } from "./envCache.ts";
+import {
+  formatScanRoots,
+  LAST_SCAN_ROOTS_ENV,
+  parseLastScanRoots,
+  resolveScanRootAnswer,
+  serializeScanRoots,
+} from "./scanRoots.ts";
 import { errorMessage, info, style, success, warning } from "./terminalStyle.ts";
 import {
   findRootFoldersWithFileProgress,
@@ -41,6 +49,17 @@ async function main(): Promise<void> {
 
   for (const project of workspace.projects) {
     console.log(`- ${style.bold(project.name)}: ${style.dim(project.rootPath)}`);
+  }
+
+  const scrubbedCodexRoots = await scrubStaleCodexWorktreeProjects(
+    workspace.projects[0].rootPath,
+  );
+  if (scrubbedCodexRoots.length > 0) {
+    console.log(
+      success(
+        `Removed ${scrubbedCodexRoots.length} stale Codex Desktop worktree project(s).`,
+      ),
+    );
   }
 
   const poller = await GitHubIssuePoller.fromWorkspace(workspace);
@@ -137,19 +156,32 @@ function truncateMiddle(value: string, maxLength: number): string {
 
 async function promptForScanRoots(): Promise<string[]> {
   const terminal = createInterface({ input, output });
+  const lastScanRoots = parseLastScanRoots();
+
+  if (lastScanRoots.length > 0) {
+    console.log(info(`Last AGSC search: ${formatScanRoots(lastScanRoots)}`));
+  }
 
   try {
+    const prompt =
+      lastScanRoots.length > 0
+        ? 'Root folder path(s) to scan. Press Enter to use last search, type "." for current folder, or enter comma-separated path(s): '
+        : `Root folder path(s) to scan, comma-separated [${DEFAULT_SCAN_ROOT}]: `;
     const answer = await terminal.question(
-      `Root folder path(s) to scan, comma-separated [${DEFAULT_SCAN_ROOT}]: `,
+      prompt,
     );
-    const rawPaths = answer
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter(Boolean);
+    const scanRoots = resolveScanRootAnswer(
+      answer,
+      DEFAULT_SCAN_ROOT,
+      lastScanRoots,
+    );
 
-    return (rawPaths.length > 0 ? rawPaths : [DEFAULT_SCAN_ROOT]).map((entry) =>
-      resolve(entry),
+    await saveDotEnvValue(
+      LAST_SCAN_ROOTS_ENV,
+      serializeScanRoots(scanRoots),
     );
+
+    return scanRoots;
   } finally {
     terminal.close();
   }

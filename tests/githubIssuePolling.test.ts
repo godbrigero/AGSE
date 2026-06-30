@@ -43,6 +43,31 @@ test("selectPendingIssuesForAutomation skips PR pseudo-issues, seen issues, and 
   );
 });
 
+test("countIssuesOnly excludes PR pseudo-issues returned by the issues API", () => {
+  const count = polling.countIssuesOnly([
+    issue(1, 1, "2026-06-24T00:00:00Z", { pull_request: {} }),
+  ]);
+
+  assert.equal(count, 0);
+});
+
+test("selectPendingIssuesForAutomation skips closed workflow tombstones", () => {
+  const pending = polling.selectPendingIssuesForAutomation(
+    [
+      issue(1, 1, "2026-06-24T00:00:00Z"),
+      issue(2, 2, "2026-06-24T00:01:00Z"),
+    ],
+    new Set(),
+    new Set(),
+    new Set([1]),
+  );
+
+  assert.deepEqual(
+    pending.map((entry) => entry.id),
+    [2],
+  );
+});
+
 test("selectPendingIssuesForAutomation returns pending issues oldest first", () => {
   const pending = polling.selectPendingIssuesForAutomation(
     [

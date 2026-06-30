@@ -6,6 +6,21 @@ import type { AGSCProject } from "../src/agscWorkspace.ts";
 import type { AGSCTrackedWorkflow } from "../src/agscState.ts";
 import type { GitHubIssue, GitHubPullRequest } from "../src/githubApi.ts";
 
+function withCodexWorktreesRoot<T>(rootPath: string, fn: () => T): T {
+  const previous = process.env.AGSE_CODEX_WORKTREES_ROOT;
+  process.env.AGSE_CODEX_WORKTREES_ROOT = rootPath;
+
+  try {
+    return fn();
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AGSE_CODEX_WORKTREES_ROOT;
+    } else {
+      process.env.AGSE_CODEX_WORKTREES_ROOT = previous;
+    }
+  }
+}
+
 function issue(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
   return {
     id: 1001,
@@ -54,7 +69,7 @@ function workflow(overrides: Partial<AGSCTrackedWorkflow> = {}): AGSCTrackedWork
     issueTitle: "Add tests for Codex handoff!",
     issueUrl: "https://github.com/example/repo/issues/42",
     agent: "codex",
-    worktreePath: "/tmp/AGSE/.agse/worktrees/issue-42-add-tests-for-codex-handoff",
+    worktreePath: automation.buildIssueWorktreePath("/tmp/AGSE", issue()),
     branchName: "agse/issue-42-add-tests-for-codex-handoff",
     pullNumber: 7,
     pullUrl: "https://github.com/example/repo/pull/7",
@@ -140,8 +155,14 @@ test("issue branch, worktree, and pull request title are stable and identifiable
     automation.buildIssueBranchName(sample),
     "agse/issue-42-add-tests-for-codex-handoff",
   );
+  withCodexWorktreesRoot("/tmp/codex-worktrees", () => {
+    assert.match(
+      automation.buildIssueWorktreePath("/repo", sample),
+      /^\/tmp\/codex-worktrees\/[a-f0-9]{4}\/issue-42-add-tests-for-codex-handoff$/,
+    );
+  });
   assert.equal(
-    automation.buildIssueWorktreePath("/repo", sample),
+    automation.buildLegacyIssueWorktreePath("/repo", sample),
     join("/repo", ".agse", "worktrees", "issue-42-add-tests-for-codex-handoff"),
   );
   assert.equal(
@@ -162,7 +183,7 @@ test("Codex handoff instructions are implementation-oriented and include tracked
   assert.match(instructions, /Pull request URL: https:\/\/github\.com\/example\/repo\/pull\/7/);
   assert.match(instructions, /Pull request description:\n## Issue\n\nCloses #42/);
   assert.match(instructions, /PR branch: agse\/issue-42-add-tests-for-codex-handoff/);
-  assert.match(instructions, /Worktree: \/tmp\/AGSE\/\.agse\/worktrees/);
+  assert.match(instructions, /Worktree: .*\/worktrees\/[a-f0-9]{4}\/issue-42/);
 });
 
 test("initial Codex handoff message starts with the exact PR title and includes full context", () => {
@@ -179,6 +200,62 @@ test("initial Codex handoff message starts with the exact PR title and includes 
   assert.match(message, /Issue description:\nThe automation should keep polling/);
   assert.match(message, /Pull request description:\n## Issue\n\nCloses #42/);
   assert.match(message, /Begin immediately\. Do not wait for another message\./);
+});
+
+test("planning prompt is read-only and requires a proposed plan block", () => {
+  const message = automation.buildPlanningPrompt(
+    issue(),
+    pullRequest(),
+    workflow(),
+  );
+
+  assert.match(message, /planning only/i);
+  assert.match(message, /Do not edit files/);
+  assert.match(message, /<proposed_plan>/);
+  assert.match(message, /Worktree: .*\/worktrees\/[a-f0-9]{4}\/issue-42/);
+});
+
+test("planned PR body preserves issue source text and appends Codex plan", () => {
+  const body = automation.buildPlannedPullRequestBody(
+    issue(),
+    "# Plan\n\n- Inspect\n- Implement",
+  );
+
+  assert.match(body, /## Issue\n\nCloses #42/);
+  assert.match(body, /The automation should keep polling/);
+  assert.match(body, /## Codex Plan\n\n# Plan/);
+});
+
+test("PR metadata can be embedded, parsed, stripped, and rebuilt from workflow state", () => {
+  const sampleWorkflow = workflow({
+    codexThreadId: "thread-1",
+    codexImplementationTurnId: "turn-1",
+    codexActiveTurnId: "turn-1",
+    agentHandoffPhase: "implementing",
+  });
+  const metadata = automation.buildPullRequestMetadata(
+    issue(),
+    sampleWorkflow,
+  );
+  const body = automation.withPullRequestMetadata("## Body\n\nVisible", metadata);
+
+  assert.match(body, /agsc:metadata/);
+  assert.deepEqual(automation.parsePullRequestMetadata(body), metadata);
+  assert.equal(automation.stripPullRequestMetadata(body), "## Body\n\nVisible");
+  assert.deepEqual(
+    automation.buildPullRequestMetadataFromWorkflow(sampleWorkflow),
+    metadata,
+  );
+});
+
+test("extractProposedPlan returns the proposed plan block when present", () => {
+  assert.equal(
+    automation.extractProposedPlan(
+      "intro\n<proposed_plan>\n# Fix\n\n- Do it\n</proposed_plan>\noutro",
+    ),
+    "# Fix\n\n- Do it",
+  );
+  assert.equal(automation.extractProposedPlan("plain response"), "plain response");
 });
 
 test("Codex handoff git state requires clean pushed branch with real work commit", () => {
@@ -226,6 +303,11 @@ test("Codex handoff workflows use executable local settings", () => {
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.sandbox, "danger-full-access");
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.approvalPolicy, "never");
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.experimentalApi, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDaemonProxy, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useRemoteControlDaemon, false);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDaemonProxy, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDesktopApp, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDesktopApp, true);
 });
 
 test("Codex continuation message instructs the same thread to finish commit and push", () => {
@@ -261,6 +343,60 @@ test("Codex PR update message sends reviewer feedback as a normal follow-up", ()
   assert.match(message, /Do not only acknowledge the feedback/);
   assert.match(message, /AGSC will commit and push them/);
   assert.match(message, /this is not enough add 5 more tests/);
+});
+
+test("PR event helpers format events, merge ids, and ignore AGSC marker comments", () => {
+  assert.equal(
+    automation.isAGSCComment("<!-- agsc:implementation-complete -->\ndone"),
+    true,
+  );
+  assert.equal(automation.isAGSCComment("human feedback"), false);
+  assert.deepEqual(
+    automation.mergeSyncedEventIds(["comment:1"], ["comment:1", "review:2"]),
+    ["comment:1", "review:2"],
+  );
+  assert.match(
+    automation.formatPullRequestComment({
+      id: 1,
+      body: "please add a test",
+      html_url: "https://github.com/example/repo/pull/7#issuecomment-1",
+      created_at: "2026-06-25T04:19:00Z",
+      updated_at: "2026-06-25T04:20:00Z",
+      user: { login: "godbrigero" },
+    }),
+    /Comment by godbrigero at 2026-06-25T04:20:00Z:\nplease add a test/,
+  );
+});
+
+test("extractTurnStatus finds nested Codex turn status", () => {
+  assert.equal(
+    automation.extractTurnStatus(
+      {
+        thread: {
+          turns: [
+            { id: "turn-1", status: "completed" },
+            { id: "turn-2", status: "inProgress" },
+          ],
+        },
+      },
+      "turn-2",
+    ),
+    "inProgress",
+  );
+  assert.equal(automation.extractTurnStatus({ thread: { turns: [] } }, "missing"), null);
+});
+
+test("implementation complete comment is marked so PR sync can ignore it", () => {
+  const body = automation.buildImplementationCompleteComment(
+    workflow({
+      codexThreadId: "thread-1",
+      codexImplementationTurnId: "turn-1",
+    }),
+  );
+
+  assert.match(body, /agsc:implementation-complete/);
+  assert.match(body, /Codex thread: thread-1/);
+  assert.equal(automation.isAGSCComment(body), true);
 });
 
 test("Codex PR update git state requires feedback to produce a new pushed commit", () => {
