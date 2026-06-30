@@ -482,38 +482,11 @@ async function validateTrackedAgentSession(
   }
 
   if (availability === "archived") {
-    const activeCodex = activeCodexHandoffs.get(workflow.issueId);
-    const codex = activeCodex ?? createCodexHandoffWorkflows(workflow.worktreePath);
-
-    try {
-      await codex.unarchiveChat(workflow.codexThreadId);
-      await registerCodexWorktreeProject(
-        project,
-        workflow,
-        workflow.codexThreadId,
-        buildPullRequestTitle({
-          number: workflow.issueNumber,
-          title: workflow.issueTitle,
-        } as GitHubIssue),
-      );
-      console.log(
-        success(
-          `[agsc] ${project.name} #${workflow.issueNumber}: unarchived Codex thread ${workflow.codexThreadId}.`,
-        ),
-      );
+    if (await restoreArchivedCodexThread(project, workflow)) {
       return workflow;
-    } catch (error) {
-      console.log(
-        warning(
-          `[agsc] ${project.name} #${workflow.issueNumber}: Codex thread ${workflow.codexThreadId} is archived but could not be unarchived: ${formatError(error)}`,
-        ),
-      );
-      return workflow;
-    } finally {
-      if (!activeCodex) {
-        codex.close();
-      }
     }
+
+    return workflow;
   }
 
   const nextWorkflow: AGSCTrackedWorkflow = {
@@ -529,6 +502,64 @@ async function validateTrackedAgentSession(
   await stateStore.upsertWorkflow(nextWorkflow);
 
   return nextWorkflow;
+}
+
+async function restoreArchivedCodexThread(
+  project: AGSCProject,
+  workflow: AGSCTrackedWorkflow,
+): Promise<boolean> {
+  if (!workflow.codexThreadId) {
+    return false;
+  }
+
+  const activeCodex = activeCodexHandoffs.get(workflow.issueId);
+  const codex = activeCodex ?? createCodexHandoffWorkflows(workflow.worktreePath);
+
+  try {
+    await codex.unarchiveChat(workflow.codexThreadId);
+    await registerCodexWorktreeProject(
+      project,
+      workflow,
+      workflow.codexThreadId,
+      buildPullRequestTitle({
+        number: workflow.issueNumber,
+        title: workflow.issueTitle,
+      } as GitHubIssue),
+    );
+
+    const restoredAvailability = await findCodexThreadAvailability(
+      workflow.worktreePath,
+      workflow.codexThreadId,
+      workflow.issueId,
+    );
+
+    if (restoredAvailability !== "active" && restoredAvailability !== "unknown") {
+      console.log(
+        warning(
+          `[agsc] ${project.name} #${workflow.issueNumber}: requested unarchive for Codex thread ${workflow.codexThreadId}, but it is still ${restoredAvailability}.`,
+        ),
+      );
+      return false;
+    }
+
+    console.log(
+      success(
+        `[agsc] ${project.name} #${workflow.issueNumber}: unarchived Codex thread ${workflow.codexThreadId}.`,
+      ),
+    );
+    return true;
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] ${project.name} #${workflow.issueNumber}: Codex thread ${workflow.codexThreadId} is archived but could not be unarchived: ${formatError(error)}`,
+      ),
+    );
+    return false;
+  } finally {
+    if (!activeCodex) {
+      codex.close();
+    }
+  }
 }
 
 async function migrateTrackedWorkflowWorktree(
