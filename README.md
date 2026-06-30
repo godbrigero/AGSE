@@ -2,6 +2,10 @@
 
 Minimal Node + TypeScript project that runs `.ts` files directly with Node's type stripping.
 
+## Disposable verification
+
+Issue #30 is a temporary AGSE Codex Desktop sidebar lifecycle and PR feedback routing verification. No runtime behavior changes are intended for this disposable PR.
+
 ## Commands
 
 ```sh
