@@ -63,6 +63,15 @@ export type GitHubPullRequestReview = {
 
 export type GitHubReactionContent = "eyes";
 
+export type GitHubRepositoryHook = {
+  id: number;
+  name: string;
+  active: boolean;
+  events: string[];
+  config: Record<string, unknown>;
+  ws_url?: string;
+};
+
 export type CreatePullRequestInput = {
   title: string;
   body: string;
@@ -77,6 +86,17 @@ export type CreateIssueInput = {
   labels?: string[];
   assignees?: string[];
 };
+
+export type CreateRepositoryHookInput = {
+  name: string;
+  active?: boolean;
+  events?: string[];
+  config?: Record<string, unknown>;
+};
+
+export type UpdateRepositoryHookInput = Partial<
+  Pick<GitHubRepositoryHook, "active" | "events" | "config">
+>;
 
 export class GitHubApiClient {
   private readonly token?: string;
@@ -286,6 +306,39 @@ export class GitHubApiClient {
     return this.request<GitHubPullRequestReview[]>(
       this.repoUrl(repository, `pulls/${pullNumber}/reviews`),
     );
+  }
+
+  async createRepositoryHook(
+    repository: GitHubRepositoryRef,
+    input: CreateRepositoryHookInput,
+  ): Promise<GitHubRepositoryHook> {
+    return this.request<GitHubRepositoryHook>(this.repoUrl(repository, "hooks"), {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  async updateRepositoryHook(
+    repository: GitHubRepositoryRef,
+    hookId: number,
+    input: UpdateRepositoryHookInput,
+  ): Promise<GitHubRepositoryHook> {
+    return this.request<GitHubRepositoryHook>(
+      this.repoUrl(repository, `hooks/${hookId}`),
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+      },
+    );
+  }
+
+  async deleteRepositoryHook(
+    repository: GitHubRepositoryRef,
+    hookId: number,
+  ): Promise<void> {
+    await this.request<void>(this.repoUrl(repository, `hooks/${hookId}`), {
+      method: "DELETE",
+    });
   }
 
   private repoUrl(repository: GitHubRepositoryRef, path: string): URL {

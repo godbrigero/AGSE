@@ -71,7 +71,7 @@ async function main(): Promise<void> {
 
   console.log(
     info(
-      `Polling GitHub issues for ${poller.projectCount} project(s) every 20 seconds. Press Ctrl+C to stop.`,
+      `Polling GitHub issues for ${poller.projectCount} project(s) every 20 seconds and using websocket updates when available. Press Ctrl+C to stop.`,
     ),
   );
 
@@ -97,7 +97,7 @@ async function ensureGitHubToken(): Promise<void> {
   );
   console.log(
     info(
-      "Create a fine-grained token with Issues read, Pull requests read/write, and Contents read/write.",
+      "Create a fine-grained token with Issues read, Pull requests read/write, Contents read/write, and Webhooks read/write. Classic tokens need admin:repo_hook.",
     ),
   );
 
