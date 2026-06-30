@@ -71,6 +71,7 @@ const CODEX_HANDOFF_OPTIONS: CodexWorkflowOptions = {
 };
 const activeCodexHandoffs = new Map<number, CodexWorkflows>();
 const terminalCodexTurnStatuses = new Set(["interrupted", "failed", "cancelled"]);
+type CodexThreadAvailability = "active" | "archived" | "missing" | "unknown";
 let codexHandoffWorkflowFactory = (projectRootPath: string): CodexWorkflows =>
   new CodexWorkflows(projectRootPath, CODEX_HANDOFF_OPTIONS);
 type CodexWorkspaceRootRegistrar = typeof registerCodexWorkspaceRoot;
@@ -312,6 +313,7 @@ export async function syncTrackedPullRequests(
         pullRequest,
         github,
       );
+      continue;
     }
 
     const workflowAfterCodexSync = await syncCodexImplementationStatus(
@@ -469,20 +471,27 @@ async function validateTrackedAgentSession(
     return workflow;
   }
 
-  const exists = await codexThreadExists(
+  const availability = await findCodexThreadAvailability(
     workflow.worktreePath,
     workflow.codexThreadId,
     workflow.issueId,
   );
 
-  if (exists) {
+  if (availability === "active" || availability === "unknown") {
+    return workflow;
+  }
+
+  if (availability === "archived") {
+    if (await restoreArchivedCodexThread(project, workflow)) {
+      return workflow;
+    }
+
     return workflow;
   }
 
   const nextWorkflow: AGSCTrackedWorkflow = {
     ...workflow,
-    codexThreadId: undefined,
-    agentHandoffStartedAt: undefined,
+    ...resetCodexSessionFields(),
   };
 
   console.log(
@@ -493,6 +502,64 @@ async function validateTrackedAgentSession(
   await stateStore.upsertWorkflow(nextWorkflow);
 
   return nextWorkflow;
+}
+
+async function restoreArchivedCodexThread(
+  project: AGSCProject,
+  workflow: AGSCTrackedWorkflow,
+): Promise<boolean> {
+  if (!workflow.codexThreadId) {
+    return false;
+  }
+
+  const activeCodex = activeCodexHandoffs.get(workflow.issueId);
+  const codex = activeCodex ?? createCodexHandoffWorkflows(workflow.worktreePath);
+
+  try {
+    await codex.unarchiveChat(workflow.codexThreadId);
+    await registerCodexWorktreeProject(
+      project,
+      workflow,
+      workflow.codexThreadId,
+      buildPullRequestTitle({
+        number: workflow.issueNumber,
+        title: workflow.issueTitle,
+      } as GitHubIssue),
+    );
+
+    const restoredAvailability = await findCodexThreadAvailability(
+      workflow.worktreePath,
+      workflow.codexThreadId,
+      workflow.issueId,
+    );
+
+    if (restoredAvailability !== "active" && restoredAvailability !== "unknown") {
+      console.log(
+        warning(
+          `[agsc] ${project.name} #${workflow.issueNumber}: requested unarchive for Codex thread ${workflow.codexThreadId}, but it is still ${restoredAvailability}.`,
+        ),
+      );
+      return false;
+    }
+
+    console.log(
+      success(
+        `[agsc] ${project.name} #${workflow.issueNumber}: unarchived Codex thread ${workflow.codexThreadId}.`,
+      ),
+    );
+    return true;
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] ${project.name} #${workflow.issueNumber}: Codex thread ${workflow.codexThreadId} is archived but could not be unarchived: ${formatError(error)}`,
+      ),
+    );
+    return false;
+  } finally {
+    if (!activeCodex) {
+      codex.close();
+    }
+  }
 }
 
 async function migrateTrackedWorkflowWorktree(
@@ -534,32 +601,47 @@ async function migrateTrackedWorkflowWorktree(
   return migratedWorkflow;
 }
 
-async function codexThreadExists(
+async function findCodexThreadAvailability(
   projectRootPath: string,
   threadId: string,
   issueId?: number,
-): Promise<boolean> {
+): Promise<CodexThreadAvailability> {
   const activeCodex = issueId
     ? activeCodexHandoffs.get(issueId)
     : undefined;
   const codex = activeCodex ?? createCodexHandoffWorkflows(projectRootPath);
 
   try {
-    const list = await codex.listChats({
+    const activeList = await codex.listChats({
       cwd: projectRootPath,
       sourceKinds: [],
       archived: false,
       limit: 50,
     });
 
-    return extractCodexThreadIds(list).has(threadId);
+    if (extractCodexThreadIds(activeList).has(threadId)) {
+      return "active";
+    }
+
+    const archivedList = await codex.listChats({
+      cwd: projectRootPath,
+      sourceKinds: [],
+      archived: true,
+      limit: 50,
+    });
+
+    if (extractCodexThreadIds(archivedList).has(threadId)) {
+      return "archived";
+    }
+
+    return "missing";
   } catch (error) {
     console.log(
       warning(
         `[agsc] Could not validate Codex thread ${threadId}: ${formatError(error)}`,
       ),
     );
-    return true;
+    return "unknown";
   } finally {
     if (!activeCodex) {
       codex.close();
@@ -1380,6 +1462,10 @@ function isRecoverableCodexSteerError(error: unknown): boolean {
     message.includes("missing field `expectedTurnId`") ||
     message.includes("missing field expectedTurnId")
   );
+}
+
+function isMissingCodexThreadError(error: unknown): boolean {
+  return formatError(error).includes("thread not found");
 }
 
 async function finalizeCodexWorktreeChanges(
@@ -2289,6 +2375,22 @@ async function notifyAgentAboutPullRequestUpdate(
       codexImplementationCommentedAt: undefined,
       agentHandoffPhase: "implementing",
     };
+  } catch (error) {
+    if (!isMissingCodexThreadError(error)) {
+      throw error;
+    }
+
+    await new AGSCStateStore(project.rootPath).upsertWorkflow({
+      ...workflow,
+      ...resetCodexSessionFields(),
+    });
+
+    if (activeCodex) {
+      closeCodexHandoff(workflow.issueId);
+      keepCodexOpen = true;
+    }
+
+    throw error;
   } finally {
     if (!keepCodexOpen) {
       projectCodex.close();
@@ -2884,6 +2986,7 @@ export const __testing = {
   CODEX_HANDOFF_PROMPT_VERSION,
   CODEX_HANDOFF_OPTIONS,
   createCodexHandoffWorkflows,
+  findCodexThreadAvailability,
   setCodexHandoffWorkflowFactory,
   closeAllCodexHandoffs,
   setCodexWorkspaceRootRegistrar,
@@ -2901,6 +3004,7 @@ export const __testing = {
   buildPullRequestTitle,
   extractProposedPlan,
   extractTurnStatus,
+  isMissingCodexThreadError,
   parsePullRequestMetadata,
   stripPullRequestMetadata,
   withPullRequestMetadata,
