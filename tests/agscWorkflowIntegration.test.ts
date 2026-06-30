@@ -115,6 +115,9 @@ test("issue automation creates PR chat, updates PR with plan, and starts detache
     assert.deepEqual(codex.renamedThreads, [
       { threadId: "thread-1", title: "Issue #42: Test AGSE workflow" },
     ]);
+    assert.deepEqual(github.issueReactions, [
+      { issueNumber: 7, content: "eyes" },
+    ]);
     assert.match(codex.messages[0] ?? "", /planning only/i);
     assert.match(codex.detachedMessages[0] ?? "", /Now execute the plan/);
 
@@ -127,6 +130,41 @@ test("issue automation creates PR chat, updates PR with plan, and starts detache
     assert.equal(workflow.codexActiveTurnId, "impl-turn-1");
     assert.equal(workflow.agentHandoffPhase, "implementing");
     assert.equal(typeof workflow.issueClosedByAGSCAt, "string");
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
+test("PR planning eyes reaction failure does not block Codex implementation", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    github.failNextIssueReaction = true;
+    const result = await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+
+    assert.equal(result.status, "tracked");
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    assert.deepEqual(github.issueReactions, []);
+    assert.match(codex.messages[0] ?? "", /planning only/i);
+    assert.match(codex.detachedMessages[0] ?? "", /Now execute the plan/);
   } finally {
     restoreRegistrar();
     restoreFactory();
@@ -1023,7 +1061,9 @@ class FakeGitHub {
   pullRequest: GitHubPullRequest | undefined;
   comments: GitHubIssueComment[] = [];
   commentReactions: Array<{ commentId: number; content: string }> = [];
+  issueReactions: Array<{ issueNumber: number; content: string }> = [];
   failNextReaction = false;
+  failNextIssueReaction = false;
 
   constructor(issue: GitHubIssue) {
     this.issue = issue;
@@ -1132,6 +1172,19 @@ class FakeGitHub {
     }
 
     this.commentReactions.push({ commentId, content });
+  }
+
+  async addIssueReaction(
+    _repository: GitHubRepositoryRef,
+    issueNumber: number,
+    content: string,
+  ): Promise<void> {
+    if (this.failNextIssueReaction) {
+      this.failNextIssueReaction = false;
+      throw new Error("issue reaction failed");
+    }
+
+    this.issueReactions.push({ issueNumber, content });
   }
 
   addHumanComment(body: string): void {

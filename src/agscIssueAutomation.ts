@@ -1135,7 +1135,7 @@ async function runCodexPlanningAndImplementation(input: {
   threadId: string;
 }): Promise<void> {
   try {
-    const planResult = await input.codex.sendMessage(
+    const planResultPromise = input.codex.sendMessage(
       input.threadId,
       buildPlanningPrompt(input.issue, input.pullRequest, input.workflow),
       {
@@ -1144,6 +1144,13 @@ async function runCodexPlanningAndImplementation(input: {
         timeoutMs: CODEX_PLANNING_TIMEOUT_MS,
       },
     );
+    void planResultPromise.catch(() => undefined);
+    await acknowledgePullRequestPlanningStarted(
+      input.github,
+      input.repository,
+      input.pullRequest,
+    );
+    const planResult = await planResultPromise;
 
     const planTurnId = extractNotificationTurnId(planResult.completed);
     const plan = extractProposedPlan(planResult.finalResponse);
@@ -1220,6 +1227,22 @@ async function runCodexPlanningAndImplementation(input: {
       ),
     );
     closeCodexHandoff(input.workflow.issueId);
+  }
+}
+
+async function acknowledgePullRequestPlanningStarted(
+  github: GitHubApiClient,
+  repository: GitHubRepositoryRef,
+  pullRequest: GitHubPullRequest,
+): Promise<void> {
+  try {
+    await github.addIssueReaction(repository, pullRequest.number, "eyes");
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] Could not add eyes reaction to PR #${pullRequest.number}: ${formatError(error)}`,
+      ),
+    );
   }
 }
 
