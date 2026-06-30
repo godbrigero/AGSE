@@ -23,6 +23,8 @@ npm run typecheck
 
 The app entrypoint is `src/main.ts`. This project intentionally does not compile TypeScript to JavaScript before running.
 
+AGSE still polls GitHub every 20 seconds, and when `GITHUB_TOKEN` has webhook permissions it also subscribes to GitHub webhook relay websocket updates to run the same sync path sooner. Fine-grained tokens need Webhooks read/write in addition to Issues read, Pull requests read/write, and Contents read/write. Classic tokens need `admin:repo_hook`.
+
 ## Integrations
 
 - `src/gitWorkflows` wraps Git operations for a repository path.

@@ -84,3 +84,66 @@ test("selectPendingIssuesForAutomation returns pending issues oldest first", () 
     [2, 3, 1],
   );
 });
+
+test("runSerializedProjectPoll runs immediately when idle", async () => {
+  const state = { isPolling: false, pollAgainRequested: false };
+  let pollCount = 0;
+
+  await polling.runSerializedProjectPoll(state, async () => {
+    pollCount += 1;
+  });
+
+  assert.equal(pollCount, 1);
+  assert.equal(state.isPolling, false);
+  assert.equal(state.pollAgainRequested, false);
+});
+
+test("runSerializedProjectPoll coalesces overlapping requests into one follow-up poll", async () => {
+  const state = { isPolling: false, pollAgainRequested: false };
+  let pollCount = 0;
+  let releaseFirstPoll: (() => void) | undefined;
+  const firstPollBlocker = new Promise<void>((resolve) => {
+    releaseFirstPoll = resolve;
+  });
+
+  const firstPoll = polling.runSerializedProjectPoll(state, async () => {
+    pollCount += 1;
+
+    if (pollCount === 1) {
+      await firstPollBlocker;
+    }
+  });
+
+  await waitFor(() => state.isPolling);
+  await polling.runSerializedProjectPoll(state, async () => {
+    throw new Error("overlapping poll callback should not run");
+  });
+  await polling.runSerializedProjectPoll(state, async () => {
+    throw new Error("second overlapping poll callback should not run");
+  });
+
+  assert.equal(pollCount, 1);
+  assert.equal(state.pollAgainRequested, true);
+
+  assert.ok(releaseFirstPoll);
+  releaseFirstPoll();
+  await firstPoll;
+
+  assert.equal(pollCount, 2);
+  assert.equal(state.isPolling, false);
+  assert.equal(state.pollAgainRequested, false);
+});
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (predicate()) {
+      return;
+    }
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+  }
+
+  assert.equal(predicate(), true);
+}

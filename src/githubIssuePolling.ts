@@ -11,6 +11,11 @@ import {
   type GitHubRepositoryRef,
   type GitHubUser,
 } from "./githubApi.ts";
+import {
+  DEFAULT_GITHUB_WEBHOOK_RELAY_EVENTS,
+  GitHubWebhookRelaySubscriber,
+  type GitHubWebhookRelayEvent,
+} from "./githubWebhookRelay.ts";
 import { AGSCStateStore } from "./agscState.ts";
 import { errorMessage, info, style, success, warning } from "./terminalStyle.ts";
 
@@ -18,6 +23,24 @@ export type GitHubIssuePollerOptions = {
   intervalMs?: number;
   token?: string;
   now?: () => Date;
+  webhookEvents?: readonly string[];
+  createWebhookSubscriber?: (
+    options: GitHubIssueWebhookSubscriberOptions,
+  ) => GitHubIssueWebhookSubscriber;
+};
+
+export type GitHubIssueWebhookSubscriberOptions = {
+  github: GitHubApiClient;
+  repository: GitHubRepositoryRef;
+  token: string;
+  events: readonly string[];
+  onEvent: (event: GitHubWebhookRelayEvent) => void;
+  onError: (error: Error) => void;
+};
+
+export type GitHubIssueWebhookSubscriber = {
+  start(): Promise<void>;
+  stop(): void;
 };
 
 type ProjectIssuePollState = {
@@ -25,6 +48,7 @@ type ProjectIssuePollState = {
   repository: GitHubRepositoryRef;
   seenIssueIds: Set<number>;
   isPolling: boolean;
+  pollAgainRequested: boolean;
 };
 
 export class GitHubIssuePoller {
@@ -33,12 +57,19 @@ export class GitHubIssuePoller {
   private readonly now: () => Date;
   private readonly github: GitHubApiClient;
   private readonly localUser: GitHubUser | null;
+  private readonly token?: string;
+  private readonly webhookEvents: readonly string[];
+  private readonly createWebhookSubscriber: (
+    options: GitHubIssueWebhookSubscriberOptions,
+  ) => GitHubIssueWebhookSubscriber;
+  private readonly webhookSubscribers: GitHubIssueWebhookSubscriber[] = [];
   private timer: NodeJS.Timeout | undefined;
 
   private constructor(
     states: ProjectIssuePollState[],
     github: GitHubApiClient,
     localUser: GitHubUser | null,
+    token: string | undefined,
     options: GitHubIssuePollerOptions = {},
   ) {
     this.states = states;
@@ -46,6 +77,11 @@ export class GitHubIssuePoller {
     this.now = options.now ?? (() => new Date());
     this.github = github;
     this.localUser = localUser;
+    this.token = token;
+    this.webhookEvents = options.webhookEvents ?? DEFAULT_GITHUB_WEBHOOK_RELAY_EVENTS;
+    this.createWebhookSubscriber =
+      options.createWebhookSubscriber ??
+      ((subscriberOptions) => new GitHubWebhookRelaySubscriber(subscriberOptions));
   }
 
   static async fromWorkspace(
@@ -93,10 +129,11 @@ export class GitHubIssuePoller {
         repository,
         seenIssueIds: new Set<number>(),
         isPolling: false,
+        pollAgainRequested: false,
       });
     }
 
-    return new GitHubIssuePoller(states, github, localUser, options);
+    return new GitHubIssuePoller(states, github, localUser, token, options);
   }
 
   start(): void {
@@ -105,35 +142,75 @@ export class GitHubIssuePoller {
     }
 
     void this.pollOnce();
+    this.startWebhookSubscribers();
     this.timer = setInterval(() => {
       void this.pollOnce();
     }, this.intervalMs);
   }
 
   stop(): void {
-    if (!this.timer) {
-      return;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
     }
 
-    clearInterval(this.timer);
-    this.timer = undefined;
+    for (const subscriber of this.webhookSubscribers.splice(0)) {
+      subscriber.stop();
+    }
   }
 
   async pollOnce(): Promise<void> {
-    await Promise.all(this.states.map((state) => this.pollProject(state)));
+    await Promise.all(
+      this.states.map((state) =>
+        runSerializedProjectPoll(state, () => this.pollProject(state)),
+      ),
+    );
   }
 
   get projectCount(): number {
     return this.states.length;
   }
 
-  private async pollProject(state: ProjectIssuePollState): Promise<void> {
-    if (state.isPolling) {
+  private startWebhookSubscribers(): void {
+    if (!this.token) {
       return;
     }
 
-    state.isPolling = true;
+    for (const state of this.states) {
+      const subscriber = this.createWebhookSubscriber({
+        github: this.github,
+        repository: state.repository,
+        token: this.token,
+        events: this.webhookEvents,
+        onEvent: (event) => {
+          console.log(
+            info(
+              `[github] ${state.project.name}: received ${event.eventName} webhook${event.deliveryId ? ` (${event.deliveryId})` : ""}; scheduling poll.`,
+            ),
+          );
+          void runSerializedProjectPoll(state, () => this.pollProject(state));
+        },
+        onError: (error) => {
+          console.warn(
+            warning(
+              `[github] ${state.project.name}: websocket updates unavailable: ${formatError(error)}. Continuing with ${this.intervalMs / 1_000}s polling.`,
+            ),
+          );
+        },
+      });
 
+      this.webhookSubscribers.push(subscriber);
+      void subscriber.start().catch((error) => {
+        console.warn(
+          warning(
+            `[github] ${state.project.name}: could not subscribe to websocket updates: ${formatError(error)}. Continuing with ${this.intervalMs / 1_000}s polling.`,
+          ),
+        );
+      });
+    }
+    }
+
+  private async pollProject(state: ProjectIssuePollState): Promise<void> {
     try {
       console.log(
         info(
@@ -185,8 +262,6 @@ export class GitHubIssuePoller {
           `[github] Failed to poll ${state.repository.owner}/${state.repository.repo}: ${formatError(error)}`,
         ),
       );
-    } finally {
-      state.isPolling = false;
     }
   }
 
@@ -208,6 +283,27 @@ export class GitHubIssuePoller {
       trackedIssueIds,
       closedWorkflowIssueIds,
     );
+  }
+}
+
+async function runSerializedProjectPoll(
+  state: Pick<ProjectIssuePollState, "isPolling" | "pollAgainRequested">,
+  poll: () => Promise<void>,
+): Promise<void> {
+  if (state.isPolling) {
+    state.pollAgainRequested = true;
+    return;
+  }
+
+  state.isPolling = true;
+
+  try {
+    do {
+      state.pollAgainRequested = false;
+      await poll();
+    } while (state.pollAgainRequested);
+  } finally {
+    state.isPolling = false;
   }
 }
 
@@ -289,5 +385,6 @@ function formatError(error: unknown): string {
 
 export const __testing = {
   countIssuesOnly,
+  runSerializedProjectPoll,
   selectPendingIssuesForAutomation,
 };
