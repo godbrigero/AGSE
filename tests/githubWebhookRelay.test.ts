@@ -12,6 +12,7 @@ import type {
 import {
   DEFAULT_GITHUB_WEBHOOK_RELAY_EVENTS,
   GitHubWebhookRelaySubscriber,
+  __testing as relay,
 } from "../src/githubWebhookRelay.ts";
 
 test("GitHubWebhookRelaySubscriber creates a cli hook, connects with authorization, acknowledges messages, and emits events", async () => {
@@ -128,6 +129,44 @@ test("GitHubWebhookRelaySubscriber ignores ping events", async () => {
     subscriber.stop();
     await server.close();
   }
+});
+
+test("parseRelayEvent decodes webhook payload fields used by polling", () => {
+  const event = relay.parseRelayEvent({
+    Header: {
+      "X-GitHub-Event": ["issue_comment"],
+      "X-GitHub-Delivery": ["delivery-1"],
+    },
+    Body: Buffer.from(
+      JSON.stringify({
+        issue: {
+          number: 7,
+          pull_request: {
+            url: "https://api.github.com/repos/org/repo/pulls/7",
+          },
+        },
+        comment: {
+          id: 501,
+        },
+      }),
+    ).toString("base64"),
+  });
+
+  assert.deepEqual(event, {
+    eventName: "issue_comment",
+    deliveryId: "delivery-1",
+    body: {
+      issue: {
+        number: 7,
+        pull_request: {
+          url: "https://api.github.com/repos/org/repo/pulls/7",
+        },
+      },
+      comment: {
+        id: 501,
+      },
+    },
+  });
 });
 
 test("GitHubWebhookRelaySubscriber stop closes the socket and prevents reconnect", async () => {

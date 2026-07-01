@@ -9,6 +9,7 @@ import { simpleGit } from "simple-git";
 import {
   handleGitHubIssueForProject,
   recoverTrackedPullRequests,
+  syncTrackedPullRequestByNumber,
   syncTrackedPullRequests,
   __testing as automation,
 } from "../src/agscIssueAutomation.ts";
@@ -334,6 +335,68 @@ test("PR comments are routed into the existing active Codex turn once per event"
       fixture.project,
       repository,
       github as never,
+    );
+    assert.equal(codex.steeredMessages.length, 1);
+  } finally {
+    restoreRegistrar();
+    restoreFactory();
+    await fixture.cleanup();
+  }
+});
+
+test("targeted PR sync routes PR comments into the existing active Codex turn once per event", async () => {
+  const fixture = await createGitFixture();
+  const github = new FakeGitHub(issue());
+  const codex = new FakeCodex();
+  const restoreFactory = automation.setCodexHandoffWorkflowFactory(
+    () => codex as unknown as CodexWorkflows,
+  );
+  const restoreRegistrar = automation.setCodexWorkspaceRootRegistrar(async () => {});
+
+  try {
+    await handleGitHubIssueForProject({
+      project: fixture.project,
+      repository,
+      issue: github.issue,
+      github: github as never,
+      localGitHubLogin: "godbrigero",
+    });
+    await waitFor(async () =>
+      Boolean(github.pullRequest?.body?.includes("## Codex Plan")),
+    );
+    await waitFor(async () => {
+      const state = await new AGSCStateStore(fixture.project.rootPath).read();
+      return state.workflows[0]?.codexImplementationTurnId === "impl-turn-1";
+    });
+
+    github.addHumanComment("please route this targeted update");
+    const synced = await syncTrackedPullRequestByNumber(
+      fixture.project,
+      repository,
+      github as never,
+      7,
+    );
+
+    assert.equal(synced, true);
+    assert.equal(codex.steeredMessages.length, 1);
+    assert.equal(codex.steeredMessages[0]?.threadId, "thread-1");
+    assert.equal(codex.steeredMessages[0]?.expectedTurnId, "impl-turn-1");
+    assert.match(
+      codex.steeredMessages[0]?.input ?? "",
+      /please route this targeted update/,
+    );
+    assert.deepEqual(github.commentReactions, [
+      { commentId: 501, content: "eyes" },
+    ]);
+
+    const state = await new AGSCStateStore(fixture.project.rootPath).read();
+    assert.deepEqual(state.workflows[0]?.syncedPrEventIds, ["comment:501"]);
+
+    await syncTrackedPullRequestByNumber(
+      fixture.project,
+      repository,
+      github as never,
+      7,
     );
     assert.equal(codex.steeredMessages.length, 1);
   } finally {

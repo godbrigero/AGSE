@@ -2,6 +2,7 @@ import type { AGSCProject, AGSCWorkspace } from "./agscWorkspace.ts";
 import {
   handleGitHubIssueForProject,
   recoverTrackedPullRequests,
+  syncTrackedPullRequestByNumber,
   syncTrackedPullRequests,
 } from "./agscIssueAutomation.ts";
 import {
@@ -22,8 +23,13 @@ import { errorMessage, info, style, success, warning } from "./terminalStyle.ts"
 export type GitHubIssuePollerOptions = {
   intervalMs?: number;
   token?: string;
+  github?: GitHubApiClient;
   now?: () => Date;
   webhookEvents?: readonly string[];
+  handleIssueForProject?: typeof handleGitHubIssueForProject;
+  recoverTrackedPullRequests?: typeof recoverTrackedPullRequests;
+  syncTrackedPullRequests?: typeof syncTrackedPullRequests;
+  syncTrackedPullRequestByNumber?: typeof syncTrackedPullRequestByNumber;
   createWebhookSubscriber?: (
     options: GitHubIssueWebhookSubscriberOptions,
   ) => GitHubIssueWebhookSubscriber;
@@ -49,7 +55,18 @@ type ProjectIssuePollState = {
   seenIssueIds: Set<number>;
   isPolling: boolean;
   pollAgainRequested: boolean;
+  followUpPoll?: () => Promise<void>;
 };
+
+type WebhookSyncTarget =
+  | {
+      kind: "issue";
+      issueNumber: number;
+    }
+  | {
+      kind: "pull";
+      pullNumber: number;
+    };
 
 export class GitHubIssuePoller {
   private readonly states: ProjectIssuePollState[];
@@ -62,6 +79,10 @@ export class GitHubIssuePoller {
   private readonly createWebhookSubscriber: (
     options: GitHubIssueWebhookSubscriberOptions,
   ) => GitHubIssueWebhookSubscriber;
+  private readonly handleIssueForProject: typeof handleGitHubIssueForProject;
+  private readonly recoverTrackedPullRequestsForProject: typeof recoverTrackedPullRequests;
+  private readonly syncTrackedPullRequestsForProject: typeof syncTrackedPullRequests;
+  private readonly syncTrackedPullRequestForProject: typeof syncTrackedPullRequestByNumber;
   private readonly webhookSubscribers: GitHubIssueWebhookSubscriber[] = [];
   private timer: NodeJS.Timeout | undefined;
 
@@ -82,6 +103,14 @@ export class GitHubIssuePoller {
     this.createWebhookSubscriber =
       options.createWebhookSubscriber ??
       ((subscriberOptions) => new GitHubWebhookRelaySubscriber(subscriberOptions));
+    this.handleIssueForProject =
+      options.handleIssueForProject ?? handleGitHubIssueForProject;
+    this.recoverTrackedPullRequestsForProject =
+      options.recoverTrackedPullRequests ?? recoverTrackedPullRequests;
+    this.syncTrackedPullRequestsForProject =
+      options.syncTrackedPullRequests ?? syncTrackedPullRequests;
+    this.syncTrackedPullRequestForProject =
+      options.syncTrackedPullRequestByNumber ?? syncTrackedPullRequestByNumber;
   }
 
   static async fromWorkspace(
@@ -90,7 +119,7 @@ export class GitHubIssuePoller {
   ): Promise<GitHubIssuePoller> {
     const states: ProjectIssuePollState[] = [];
     const token = options.token ?? process.env.GITHUB_TOKEN;
-    const github = new GitHubApiClient(token);
+    const github = options.github ?? new GitHubApiClient(token);
     const localUser = await getLocalGitHubUser(github, Boolean(token));
 
     if (!token) {
@@ -185,10 +214,22 @@ export class GitHubIssuePoller {
         onEvent: (event) => {
           console.log(
             info(
-              `[github] ${state.project.name}: received ${event.eventName} webhook${event.deliveryId ? ` (${event.deliveryId})` : ""}; scheduling immediate sync poll.`,
+              `[github] ${state.project.name}: received ${event.eventName} webhook${event.deliveryId ? ` (${event.deliveryId})` : ""}; scheduling immediate sync.`,
             ),
           );
-          void runSerializedProjectPoll(state, () => this.pollProject(state));
+          if (state.isPolling) {
+            console.log(
+              info(
+                `[github] ${state.project.name}: sync already running; scheduling follow-up full sync poll.`,
+              ),
+            );
+            void runSerializedProjectPoll(state, () => this.pollProject(state));
+            return;
+          }
+
+          void runSerializedProjectPoll(state, () =>
+            this.handleWebhookEvent(state, event),
+          );
         },
         onError: (error) => {
           console.warn(
@@ -200,15 +241,116 @@ export class GitHubIssuePoller {
       });
 
       this.webhookSubscribers.push(subscriber);
-      void subscriber.start().catch((error) => {
-        console.warn(
-          warning(
-            `[github] ${state.project.name}: could not subscribe to websocket updates: ${formatError(error)}. Continuing with ${this.intervalMs / 1_000}s polling.`,
+      void subscriber
+        .start()
+        .then(() => {
+          console.log(
+            success(`[github] ${state.project.name}: websocket updates subscribed.`),
+          );
+        })
+        .catch((error) => {
+          console.warn(
+            warning(
+              `[github] ${state.project.name}: could not subscribe to websocket updates: ${formatError(error)}. Continuing with ${this.intervalMs / 1_000}s polling.`,
+            ),
+          );
+        });
+    }
+  }
+
+  private async handleWebhookEvent(
+    state: ProjectIssuePollState,
+    event: GitHubWebhookRelayEvent,
+  ): Promise<void> {
+    try {
+      const target = selectWebhookSyncTarget(event);
+
+      if (!target) {
+        console.log(
+          info(
+            `[github] ${state.project.name}: ${event.eventName} webhook did not identify an issue or PR; running full sync poll.`,
           ),
         );
-      });
+        await this.pollProject(state);
+        return;
+      }
+
+      if (target.kind === "issue") {
+        console.log(
+          info(
+            `[github] ${state.project.name}: syncing webhook issue #${target.issueNumber}.`,
+          ),
+        );
+        await this.syncWebhookIssue(state, target.issueNumber);
+        return;
+      }
+
+      console.log(
+        info(
+          `[github] ${state.project.name}: syncing webhook PR #${target.pullNumber}.`,
+        ),
+      );
+      await this.syncWebhookPullRequest(state, target.pullNumber);
+    } catch (error) {
+      console.error(
+        errorMessage(
+          `[github] Failed to process ${event.eventName} webhook for ${state.repository.owner}/${state.repository.repo}: ${formatError(error)}`,
+        ),
+      );
     }
+  }
+
+  private async syncWebhookIssue(
+    state: ProjectIssuePollState,
+    issueNumber: number,
+  ): Promise<void> {
+    const issue = await this.github.getIssue(state.repository, issueNumber);
+
+    if (issue.state !== "open" || issue.pull_request) {
+      console.log(
+        info(
+          `[github] ${state.project.name}: webhook issue #${issueNumber} is not an open issue; no automation needed.`,
+        ),
+      );
+      return;
     }
+
+    const [pendingIssue] = await this.selectPendingIssues([issue], state);
+
+    if (!pendingIssue) {
+      console.log(
+        info(
+          `[github] ${state.project.name}: webhook issue #${issueNumber} is already tracked, seen, or closed.`,
+        ),
+      );
+      return;
+    }
+
+    await this.handlePendingIssue(state, pendingIssue);
+  }
+
+  private async syncWebhookPullRequest(
+    state: ProjectIssuePollState,
+    pullNumber: number,
+  ): Promise<void> {
+    const synced = await this.syncTrackedPullRequestForProject(
+      state.project,
+      state.repository,
+      this.github,
+      pullNumber,
+    );
+
+    if (synced) {
+      return;
+    }
+
+    console.log(
+      info(
+        `[github] ${state.project.name}: webhook PR #${pullNumber} is not tracked locally; running full sync poll.`,
+      ),
+    );
+    await this.pollProject(state);
+  }
 
   private async pollProject(state: ProjectIssuePollState): Promise<void> {
     try {
@@ -217,12 +359,16 @@ export class GitHubIssuePoller {
           `[github] Polling ${state.project.name} (${state.repository.owner}/${state.repository.repo})...`,
         ),
       );
-      await recoverTrackedPullRequests(
+      await this.recoverTrackedPullRequestsForProject(
         state.project,
         state.repository,
         this.github,
       );
-      await syncTrackedPullRequests(state.project, state.repository, this.github);
+      await this.syncTrackedPullRequestsForProject(
+        state.project,
+        state.repository,
+        this.github,
+      );
 
       const issues = await this.github.listRecentIssues(state.repository);
       const openIssueCount = countIssuesOnly(issues);
@@ -235,26 +381,7 @@ export class GitHubIssuePoller {
       );
 
       for (const issue of pendingIssues) {
-        logNewIssue(state.project, state.repository, issue);
-        try {
-          const result = await handleGitHubIssueForProject({
-            project: state.project,
-            repository: state.repository,
-            issue,
-            github: this.github,
-            localGitHubLogin: this.localUser?.login ?? state.repository.owner,
-          });
-
-          if (result.status === "tracked") {
-            state.seenIssueIds.add(issue.id);
-          }
-        } catch (error) {
-          console.error(
-            errorMessage(
-              `[github] Failed to automate ${state.project.name} #${issue.number}: ${formatError(error)}`,
-            ),
-          );
-        }
+        await this.handlePendingIssue(state, issue);
       }
     } catch (error) {
       console.error(
@@ -284,26 +411,60 @@ export class GitHubIssuePoller {
       closedWorkflowIssueIds,
     );
   }
+
+  private async handlePendingIssue(
+    state: ProjectIssuePollState,
+    issue: GitHubIssue,
+  ): Promise<void> {
+    logNewIssue(state.project, state.repository, issue);
+    try {
+      const result = await this.handleIssueForProject({
+        project: state.project,
+        repository: state.repository,
+        issue,
+        github: this.github,
+        localGitHubLogin: this.localUser?.login ?? state.repository.owner,
+      });
+
+      if (result.status === "tracked") {
+        state.seenIssueIds.add(issue.id);
+      }
+    } catch (error) {
+      console.error(
+        errorMessage(
+          `[github] Failed to automate ${state.project.name} #${issue.number}: ${formatError(error)}`,
+        ),
+      );
+    }
+  }
 }
 
 async function runSerializedProjectPoll(
-  state: Pick<ProjectIssuePollState, "isPolling" | "pollAgainRequested">,
+  state: Pick<
+    ProjectIssuePollState,
+    "isPolling" | "pollAgainRequested" | "followUpPoll"
+  >,
   poll: () => Promise<void>,
 ): Promise<void> {
   if (state.isPolling) {
     state.pollAgainRequested = true;
+    state.followUpPoll = poll;
     return;
   }
 
   state.isPolling = true;
 
   try {
+    let nextPoll = poll;
     do {
       state.pollAgainRequested = false;
-      await poll();
+      state.followUpPoll = undefined;
+      await nextPoll();
+      nextPoll = state.followUpPoll ?? poll;
     } while (state.pollAgainRequested);
   } finally {
     state.isPolling = false;
+    state.followUpPoll = undefined;
   }
 }
 
@@ -334,6 +495,88 @@ function countIssuesOnly(issues: readonly GitHubIssue[]): number {
 
 function isIssueOnly(issue: GitHubIssue): boolean {
   return !issue.pull_request;
+}
+
+function selectWebhookSyncTarget(
+  event: GitHubWebhookRelayEvent,
+): WebhookSyncTarget | null {
+  if (!isRecord(event.body)) {
+    return null;
+  }
+
+  if (event.eventName === "issues") {
+    return selectIssueTarget(event.body);
+  }
+
+  if (event.eventName === "issue_comment") {
+    return selectIssueCommentTarget(event.body);
+  }
+
+  if (
+    event.eventName === "pull_request" ||
+    event.eventName === "pull_request_review" ||
+    event.eventName === "pull_request_review_comment"
+  ) {
+    return selectPullRequestTarget(event.body);
+  }
+
+  return null;
+}
+
+function selectIssueTarget(body: Record<string, unknown>): WebhookSyncTarget | null {
+  const issue = body.issue;
+
+  if (!isRecord(issue)) {
+    return null;
+  }
+
+  const issueNumber = readWebhookNumber(issue.number);
+
+  return issueNumber ? { kind: "issue", issueNumber } : null;
+}
+
+function selectIssueCommentTarget(
+  body: Record<string, unknown>,
+): WebhookSyncTarget | null {
+  const issue = body.issue;
+
+  if (!isRecord(issue)) {
+    return null;
+  }
+
+  const issueNumber = readWebhookNumber(issue.number);
+
+  if (!issueNumber) {
+    return null;
+  }
+
+  return isRecord(issue.pull_request)
+    ? { kind: "pull", pullNumber: issueNumber }
+    : { kind: "issue", issueNumber };
+}
+
+function selectPullRequestTarget(
+  body: Record<string, unknown>,
+): WebhookSyncTarget | null {
+  const pullRequest = body.pull_request;
+
+  if (!isRecord(pullRequest)) {
+    return null;
+  }
+
+  const pullNumber = readWebhookNumber(pullRequest.number);
+
+  return pullNumber ? { kind: "pull", pullNumber } : null;
+}
+
+function readWebhookNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function getLocalGitHubUser(
@@ -386,5 +629,6 @@ function formatError(error: unknown): string {
 export const __testing = {
   countIssuesOnly,
   runSerializedProjectPoll,
+  selectWebhookSyncTarget,
   selectPendingIssuesForAutomation,
 };
