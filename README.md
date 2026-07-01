@@ -175,6 +175,8 @@ Run tests:
 npm test
 ```
 
+For full local verification, run type checking before the test suite.
+
 Run Codex diagnostics:
 
 ```sh
