@@ -658,6 +658,12 @@ test("missing Codex PR thread restarts without acknowledging PR comments", async
     );
 
     assert.equal(codex.startedChats.length, 1);
+    assert.equal(
+      codex.startedChats[0]?.cwd,
+      automation.buildIssueWorktreePath(fixture.project.rootPath, github.issue),
+    );
+    assert.equal(codex.startedChats[0]?.desktopApp, undefined);
+    assert.equal(codex.startedChats[0]?.requireDesktopApp, undefined);
     assert.deepEqual(codex.steeredMessages, []);
     assert.deepEqual(github.commentReactions, []);
 
