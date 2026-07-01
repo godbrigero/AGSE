@@ -67,8 +67,6 @@ const CODEX_HANDOFF_OPTIONS: CodexWorkflowOptions = {
   useDaemonProxy: true,
   useRemoteControlDaemon: false,
   requireDaemonProxy: true,
-  useDesktopApp: true,
-  requireDesktopApp: true,
 };
 const activeCodexHandoffs = new Map<number, CodexWorkflows>();
 const terminalCodexTurnStatuses = new Set(["interrupted", "failed", "cancelled"]);
@@ -1164,8 +1162,6 @@ async function startCodexWorkflow(
   const title = buildPullRequestTitle(issue);
   await registerCodexWorktreeProject(project, workflow, undefined, title);
   const thread = await projectCodex.startChat({
-    desktopApp: true,
-    requireDesktopApp: true,
     title,
     input: [],
     cwd: workflow.worktreePath,

@@ -306,8 +306,8 @@ test("Codex handoff workflows use executable local settings", () => {
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDaemonProxy, true);
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.useRemoteControlDaemon, false);
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDaemonProxy, true);
-  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDesktopApp, true);
-  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDesktopApp, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDesktopApp, undefined);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDesktopApp, undefined);
 });
 
 test("Codex continuation message instructs the same thread to finish commit and push", () => {
