@@ -270,110 +270,147 @@ export async function syncTrackedPullRequests(
   const state = await stateStore.read();
 
   for (const workflow of state.workflows) {
-    if (!workflow.pullNumber) {
-      continue;
-    }
-
-    const pullRequest = await github.getPullRequest(
+    await syncTrackedPullRequestWorkflow(
+      project,
       repository,
-      workflow.pullNumber,
-    );
-
-    const issue = await github.getIssue(repository, workflow.issueNumber);
-
-    if (pullRequest.state !== "open") {
-      await cleanupClosedWorkflow(project, workflow, stateStore, "PR closed");
-      continue;
-    }
-
-    if (issue.state !== "open" && !workflow.issueClosedByAGSCAt) {
-      await cleanupClosedWorkflow(project, workflow, stateStore, "issue closed");
-      continue;
-    }
-
-    const migratedWorkflow = await migrateTrackedWorkflowWorktree(
-      project,
-      issue,
+      github,
+      stateStore,
       workflow,
-      stateStore,
     );
-    const currentWorkflow = await validateTrackedAgentSession(
-      project,
-      migratedWorkflow,
-      stateStore,
+  }
+}
+
+export async function syncTrackedPullRequestByNumber(
+  project: AGSCProject,
+  repository: GitHubRepositoryRef,
+  github: GitHubApiClient,
+  pullNumber: number,
+): Promise<boolean> {
+  const stateStore = new AGSCStateStore(project.rootPath);
+  const state = await stateStore.read();
+  const workflow = state.workflows.find(
+    (trackedWorkflow) => trackedWorkflow.pullNumber === pullNumber,
+  );
+
+  if (!workflow) {
+    return false;
+  }
+
+  await syncTrackedPullRequestWorkflow(
+    project,
+    repository,
+    github,
+    stateStore,
+    workflow,
+  );
+  return true;
+}
+
+async function syncTrackedPullRequestWorkflow(
+  project: AGSCProject,
+  repository: GitHubRepositoryRef,
+  github: GitHubApiClient,
+  stateStore: AGSCStateStore,
+  workflow: AGSCTrackedWorkflow,
+): Promise<void> {
+  if (!workflow.pullNumber) {
+    return;
+  }
+
+  const pullRequest = await github.getPullRequest(repository, workflow.pullNumber);
+  const issue = await github.getIssue(repository, workflow.issueNumber);
+
+  if (pullRequest.state !== "open") {
+    await cleanupClosedWorkflow(project, workflow, stateStore, "PR closed");
+    return;
+  }
+
+  if (issue.state !== "open" && !workflow.issueClosedByAGSCAt) {
+    await cleanupClosedWorkflow(project, workflow, stateStore, "issue closed");
+    return;
+  }
+
+  const migratedWorkflow = await migrateTrackedWorkflowWorktree(
+    project,
+    issue,
+    workflow,
+    stateStore,
+  );
+  const currentWorkflow = await validateTrackedAgentSession(
+    project,
+    migratedWorkflow,
+    stateStore,
+  );
+
+  if (workflowNeedsAgentStart(currentWorkflow)) {
+    console.log(
+      warning(
+        `[agsc] ${project.name} #${currentWorkflow.issueNumber}: tracked workflow has no active ${currentWorkflow.agent} session; retrying agent startup.`,
+      ),
     );
-
-    if (workflowNeedsAgentStart(currentWorkflow)) {
-      console.log(
-        warning(
-          `[agsc] ${project.name} #${currentWorkflow.issueNumber}: tracked workflow has no active ${currentWorkflow.agent} session; retrying agent startup.`,
-        ),
-      );
-      await startAgentIfNeeded(
-        project,
-        repository,
-        currentWorkflow,
-        issue,
-        pullRequest,
-        github,
-      );
-      continue;
-    }
-
-    const workflowAfterCodexSync = await syncCodexImplementationStatus(
+    await startAgentIfNeeded(
       project,
       repository,
       currentWorkflow,
+      issue,
+      pullRequest,
       github,
     );
+    return;
+  }
 
-    const eventSummary = await buildPullRequestEventSummary(
-      github,
-      repository,
-      workflowAfterCodexSync,
-    );
+  const workflowAfterCodexSync = await syncCodexImplementationStatus(
+    project,
+    repository,
+    currentWorkflow,
+    github,
+  );
 
-    if (!eventSummary) {
-      if (pullRequest.updated_at !== workflow.lastPullUpdatedAt) {
-        await stateStore.upsertWorkflow({
-          ...workflowAfterCodexSync,
-          pullState: pullRequest.state,
-          lastPullUpdatedAt: pullRequest.updated_at,
-        });
-      }
-      continue;
-    }
+  const eventSummary = await buildPullRequestEventSummary(
+    github,
+    repository,
+    workflowAfterCodexSync,
+  );
 
-    try {
-      const notificationResult = await notifyAgentAboutPullRequestUpdate(
-        project,
-        workflowAfterCodexSync,
-        eventSummary,
-      );
-      await acknowledgePullRequestFeedbackEvents(
-        github,
-        repository,
-        eventSummary,
-      );
+  if (!eventSummary) {
+    if (pullRequest.updated_at !== workflow.lastPullUpdatedAt) {
       await stateStore.upsertWorkflow({
         ...workflowAfterCodexSync,
-        ...notificationResult,
         pullState: pullRequest.state,
         lastPullUpdatedAt: pullRequest.updated_at,
-        lastSyncedPrEventAt: new Date().toISOString(),
-        syncedPrEventIds: mergeSyncedEventIds(
-          workflowAfterCodexSync.syncedPrEventIds,
-          eventSummary.eventIds,
-        ),
       });
-    } catch (error) {
-      console.log(
-        warning(
-          `[agsc] ${project.name} #${workflowAfterCodexSync.issueNumber}: failed to notify ${workflowAfterCodexSync.agent} about PR update; will retry next poll: ${formatError(error)}`,
-        ),
-      );
-      continue;
     }
+    return;
+  }
+
+  try {
+    const notificationResult = await notifyAgentAboutPullRequestUpdate(
+      project,
+      workflowAfterCodexSync,
+      eventSummary,
+    );
+    await acknowledgePullRequestFeedbackEvents(
+      github,
+      repository,
+      eventSummary,
+    );
+    await stateStore.upsertWorkflow({
+      ...workflowAfterCodexSync,
+      ...notificationResult,
+      pullState: pullRequest.state,
+      lastPullUpdatedAt: pullRequest.updated_at,
+      lastSyncedPrEventAt: new Date().toISOString(),
+      syncedPrEventIds: mergeSyncedEventIds(
+        workflowAfterCodexSync.syncedPrEventIds,
+        eventSummary.eventIds,
+      ),
+    });
+  } catch (error) {
+    console.log(
+      warning(
+        `[agsc] ${project.name} #${workflowAfterCodexSync.issueNumber}: failed to notify ${workflowAfterCodexSync.agent} about PR update; will retry next poll: ${formatError(error)}`,
+      ),
+    );
   }
 }
 
