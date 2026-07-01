@@ -175,7 +175,7 @@ Run tests:
 npm test
 ```
 
-For local verification, run both `npm run typecheck` and `npm test`.
+Use `npm run typecheck` and `npm test` for local verification.
 
 Run Codex diagnostics:
 
