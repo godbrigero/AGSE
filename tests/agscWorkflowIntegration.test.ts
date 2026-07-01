@@ -68,8 +68,8 @@ test("issue automation creates PR chat, updates PR with plan, and starts detache
     assert.match(github.pullRequest?.body ?? "", /# Workflow Plan/);
     assert.equal(codex.startedChats.length, 1);
     assert.equal(codex.startedChats[0]?.cwd, result.workflow.worktreePath);
-    assert.equal(codex.startedChats[0]?.desktopApp, true);
-    assert.equal(codex.startedChats[0]?.requireDesktopApp, true);
+    assert.equal(codex.startedChats[0]?.desktopApp, undefined);
+    assert.equal(codex.startedChats[0]?.requireDesktopApp, undefined);
     assert.equal(codex.startedChats[0]?.title, "Issue #42: Test AGSE workflow");
     assert.deepEqual(codex.startedChats[0]?.input, []);
     assert.deepEqual(codex.startedChats[0]?.workspaceRoots, [
@@ -712,7 +712,7 @@ test("legacy AGSC worktrees are moved to the Codex worktree root", async () => {
     await stat(result.workflow.worktreePath);
     await assert.rejects(stat(legacyWorktreePath), /ENOENT/);
     assert.equal(codex.startedChats[0]?.cwd, result.workflow.worktreePath);
-    assert.equal(codex.startedChats[0]?.desktopApp, true);
+    assert.equal(codex.startedChats[0]?.desktopApp, undefined);
   } finally {
     restoreRegistrar();
     restoreFactory();
@@ -784,7 +784,7 @@ test("sync migrates already tracked legacy worktrees and restarts Codex chat", a
     assert.notEqual(migrated.worktreePath, legacyWorktreePath);
     assert.match(migrated.worktreePath, /\/codex-worktrees\/[a-f0-9]{4}\//);
     assert.equal(codex.startedChats[0]?.cwd, migrated.worktreePath);
-    assert.equal(codex.startedChats[0]?.desktopApp, true);
+    assert.equal(codex.startedChats[0]?.desktopApp, undefined);
   } finally {
     restoreRegistrar();
     restoreFactory();

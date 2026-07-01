@@ -1,6 +1,9 @@
 import type { AGSCProject, AGSCWorkspace } from "./agscWorkspace.ts";
 import {
+  type AGSCIssueScope,
   handleGitHubIssueForProject,
+  issueMatchesIssueScope,
+  issueScopeIsActive,
   recoverTrackedPullRequests,
   syncTrackedPullRequests,
 } from "./agscIssueAutomation.ts";
@@ -23,6 +26,7 @@ export type GitHubIssuePollerOptions = {
   intervalMs?: number;
   token?: string;
   now?: () => Date;
+  issueScope?: AGSCIssueScope;
   webhookEvents?: readonly string[];
   createWebhookSubscriber?: (
     options: GitHubIssueWebhookSubscriberOptions,
@@ -58,6 +62,7 @@ export class GitHubIssuePoller {
   private readonly github: GitHubApiClient;
   private readonly localUser: GitHubUser | null;
   private readonly token?: string;
+  private readonly issueScope?: AGSCIssueScope;
   private readonly webhookEvents: readonly string[];
   private readonly createWebhookSubscriber: (
     options: GitHubIssueWebhookSubscriberOptions,
@@ -78,6 +83,7 @@ export class GitHubIssuePoller {
     this.github = github;
     this.localUser = localUser;
     this.token = token;
+    this.issueScope = options.issueScope;
     this.webhookEvents = options.webhookEvents ?? DEFAULT_GITHUB_WEBHOOK_RELAY_EVENTS;
     this.createWebhookSubscriber =
       options.createWebhookSubscriber ??
@@ -92,6 +98,7 @@ export class GitHubIssuePoller {
     const token = options.token ?? process.env.GITHUB_TOKEN;
     const github = new GitHubApiClient(token);
     const localUser = await getLocalGitHubUser(github, Boolean(token));
+    const issueScope = options.issueScope ?? parseIssueScopeFromEnv();
 
     if (!token) {
       console.warn(
@@ -101,6 +108,14 @@ export class GitHubIssuePoller {
       );
     } else if (localUser) {
       console.log(success(`[github] Authenticated as ${localUser.login}.`));
+    }
+
+    if (issueScope && issueScopeIsActive(issueScope)) {
+      console.log(
+        info(
+          `[github] Restricting AGSE issue automation to ${formatIssueScope(issueScope)}.`,
+        ),
+      );
     }
 
     for (const project of workspace.projects) {
@@ -133,7 +148,10 @@ export class GitHubIssuePoller {
       });
     }
 
-    return new GitHubIssuePoller(states, github, localUser, token, options);
+    return new GitHubIssuePoller(states, github, localUser, token, {
+      ...options,
+      issueScope,
+    });
   }
 
   start(): void {
@@ -221,8 +239,11 @@ export class GitHubIssuePoller {
         state.project,
         state.repository,
         this.github,
+        { issueScope: this.issueScope },
       );
-      await syncTrackedPullRequests(state.project, state.repository, this.github);
+      await syncTrackedPullRequests(state.project, state.repository, this.github, {
+        issueScope: this.issueScope,
+      });
 
       const issues = await this.github.listRecentIssues(state.repository);
       const openIssueCount = countIssuesOnly(issues);
@@ -282,6 +303,7 @@ export class GitHubIssuePoller {
       state.seenIssueIds,
       trackedIssueIds,
       closedWorkflowIssueIds,
+      this.issueScope,
     );
   }
 }
@@ -312,9 +334,11 @@ function selectPendingIssuesForAutomation(
   seenIssueIds: ReadonlySet<number>,
   trackedIssueIds: ReadonlySet<number>,
   closedWorkflowIssueIds: ReadonlySet<number> = new Set(),
+  issueScope?: AGSCIssueScope,
 ): GitHubIssue[] {
   return issues
     .filter(isIssueOnly)
+    .filter((issue) => issueMatchesIssueScope(issue, issueScope))
     .filter(
       (issue) =>
         !seenIssueIds.has(issue.id) &&
@@ -334,6 +358,77 @@ function countIssuesOnly(issues: readonly GitHubIssue[]): number {
 
 function isIssueOnly(issue: GitHubIssue): boolean {
   return !issue.pull_request;
+}
+
+function parseIssueScopeFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): AGSCIssueScope | undefined {
+  const issueNumbers = parseIssueNumberList(env.AGSE_ACTIVE_ISSUE_NUMBERS);
+  const titleIncludes = parseTitleIncludesList(
+    env.AGSE_ACTIVE_ISSUE_TITLE_INCLUDES,
+  );
+  const scope: AGSCIssueScope = {};
+
+  if (issueNumbers.length > 0) {
+    scope.issueNumbers = issueNumbers;
+  }
+
+  if (titleIncludes.length > 0) {
+    scope.titleIncludes = titleIncludes;
+  }
+
+  return issueScopeIsActive(scope) ? scope : undefined;
+}
+
+function parseIssueNumberList(value: string | undefined): number[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const issueNumber = Number(entry);
+
+      if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+        throw new Error(
+          `AGSE_ACTIVE_ISSUE_NUMBERS must contain positive issue numbers; got "${entry}".`,
+        );
+      }
+
+      return issueNumber;
+    });
+}
+
+function parseTitleIncludesList(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function formatIssueScope(scope: AGSCIssueScope): string {
+  const parts: string[] = [];
+
+  if (scope.issueNumbers) {
+    parts.push(`issue number(s) ${Array.from(scope.issueNumbers).join(", ")}`);
+  }
+
+  if (scope.titleIncludes?.length) {
+    parts.push(
+      `title substring(s) ${scope.titleIncludes
+        .map((title) => JSON.stringify(title))
+        .join(", ")}`,
+    );
+  }
+
+  return parts.join(" and ");
 }
 
 async function getLocalGitHubUser(
@@ -385,6 +480,10 @@ function formatError(error: unknown): string {
 
 export const __testing = {
   countIssuesOnly,
+  formatIssueScope,
+  issueMatchesIssueScope,
+  issueScopeIsActive,
+  parseIssueScopeFromEnv,
   runSerializedProjectPoll,
   selectPendingIssuesForAutomation,
 };

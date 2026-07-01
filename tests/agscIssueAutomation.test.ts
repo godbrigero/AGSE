@@ -1,10 +1,23 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { __testing as automation } from "../src/agscIssueAutomation.ts";
+import {
+  recoverTrackedPullRequests,
+  syncTrackedPullRequests,
+  __testing as automation,
+} from "../src/agscIssueAutomation.ts";
+import { AGSCStateStore } from "../src/agscState.ts";
 import type { AGSCProject } from "../src/agscWorkspace.ts";
 import type { AGSCTrackedWorkflow } from "../src/agscState.ts";
-import type { GitHubIssue, GitHubPullRequest } from "../src/githubApi.ts";
+import type {
+  GitHubIssue,
+  GitHubPullRequest,
+  GitHubRepositoryRef,
+} from "../src/githubApi.ts";
+
+const repository: GitHubRepositoryRef = { owner: "example", repo: "repo" };
 
 function withCodexWorktreesRoot<T>(rootPath: string, fn: () => T): T {
   const previous = process.env.AGSE_CODEX_WORKTREES_ROOT;
@@ -248,6 +261,88 @@ test("PR metadata can be embedded, parsed, stripped, and rebuilt from workflow s
   );
 });
 
+test("syncTrackedPullRequests skips tracked workflows outside active issue scope", async () => {
+  const rootPath = await mkdtemp(join(tmpdir(), "agse-scope-sync-"));
+  const agscProject = {
+    ...project({}),
+    rootPath,
+  } as AGSCProject;
+  const storedWorkflow = workflow({
+    issueId: 9001,
+    issueNumber: 56,
+    issueTitle: "Pre-existing unrelated workflow",
+    pullNumber: 57,
+    worktreePath: join(rootPath, "worktree"),
+  });
+
+  try {
+    await new AGSCStateStore(rootPath).upsertWorkflow(storedWorkflow);
+
+    await syncTrackedPullRequests(
+      agscProject,
+      repository,
+      {
+        async getPullRequest(): Promise<GitHubPullRequest> {
+          throw new Error("unrelated workflow should not be fetched");
+        },
+      } as never,
+      { issueScope: { titleIncludes: ["20260701T080921Z"] } },
+    );
+
+    const state = await new AGSCStateStore(rootPath).read();
+    assert.deepEqual(state.workflows, [storedWorkflow]);
+  } finally {
+    await rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test("recoverTrackedPullRequests skips PR metadata outside active issue scope", async () => {
+  const rootPath = await mkdtemp(join(tmpdir(), "agse-scope-recover-"));
+  const agscProject = {
+    ...project({}),
+    rootPath,
+  } as AGSCProject;
+  const unrelatedWorkflow = workflow({
+    issueId: 9001,
+    issueNumber: 56,
+    issueTitle: "Pre-existing unrelated workflow",
+    pullNumber: 57,
+    worktreePath: join(rootPath, "worktree"),
+  });
+  const unrelatedPullRequest = pullRequest({
+    number: 57,
+    title: "Issue #56: Pre-existing unrelated workflow",
+    body: automation.withPullRequestMetadata(
+      "## Issue\n\nCloses #56",
+      automation.buildPullRequestMetadataFromWorkflow(unrelatedWorkflow),
+    ),
+  });
+
+  try {
+    const recovered = await recoverTrackedPullRequests(
+      agscProject,
+      repository,
+      {
+        async listOpenPullRequests(): Promise<GitHubPullRequest[]> {
+          return [unrelatedPullRequest];
+        },
+        async getIssue(): Promise<GitHubIssue> {
+          throw new Error("unrelated PR metadata should not fetch its issue");
+        },
+      } as never,
+      { issueScope: { titleIncludes: ["20260701T080921Z"] } },
+    );
+
+    assert.deepEqual(recovered, []);
+    assert.deepEqual(await new AGSCStateStore(rootPath).read(), {
+      workflows: [],
+      closedWorkflows: [],
+    });
+  } finally {
+    await rm(rootPath, { recursive: true, force: true });
+  }
+});
+
 test("extractProposedPlan returns the proposed plan block when present", () => {
   assert.equal(
     automation.extractProposedPlan(
@@ -306,8 +401,8 @@ test("Codex handoff workflows use executable local settings", () => {
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDaemonProxy, true);
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.useRemoteControlDaemon, false);
   assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDaemonProxy, true);
-  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDesktopApp, true);
-  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDesktopApp, true);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.useDesktopApp, false);
+  assert.equal(automation.CODEX_HANDOFF_OPTIONS.requireDesktopApp, false);
 });
 
 test("Codex continuation message instructs the same thread to finish commit and push", () => {
