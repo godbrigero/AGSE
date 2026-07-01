@@ -68,6 +68,49 @@ test("selectPendingIssuesForAutomation skips closed workflow tombstones", () => 
   );
 });
 
+test("selectPendingIssuesForAutomation limits work to the active issue scope", () => {
+  const pending = polling.selectPendingIssuesForAutomation(
+    [
+      issue(1, 10, "2026-06-24T00:00:00Z", {
+        title: "Pre-existing AGSE work",
+      }),
+      issue(2, 11, "2026-06-24T00:01:00Z", {
+        title: "AGSE workflow verification 20260701T080921Z",
+      }),
+      issue(3, 12, "2026-06-24T00:02:00Z", {
+        title: "Another AGSE workflow",
+      }),
+    ],
+    new Set(),
+    new Set(),
+    new Set(),
+    { titleIncludes: ["20260701T080921Z"] },
+  );
+
+  assert.deepEqual(
+    pending.map((entry) => entry.number),
+    [11],
+  );
+});
+
+test("selectPendingIssuesForAutomation matches active issue numbers", () => {
+  const pending = polling.selectPendingIssuesForAutomation(
+    [
+      issue(1, 10, "2026-06-24T00:00:00Z"),
+      issue(2, 11, "2026-06-24T00:01:00Z"),
+    ],
+    new Set(),
+    new Set(),
+    new Set(),
+    { issueNumbers: [10] },
+  );
+
+  assert.deepEqual(
+    pending.map((entry) => entry.number),
+    [10],
+  );
+});
+
 test("selectPendingIssuesForAutomation returns pending issues oldest first", () => {
   const pending = polling.selectPendingIssuesForAutomation(
     [
@@ -82,6 +125,29 @@ test("selectPendingIssuesForAutomation returns pending issues oldest first", () 
   assert.deepEqual(
     pending.map((entry) => entry.id),
     [2, 3, 1],
+  );
+});
+
+test("parseIssueScopeFromEnv reads active issue scope controls", () => {
+  const scope = polling.parseIssueScopeFromEnv({
+    AGSE_ACTIVE_ISSUE_NUMBERS: "60, 61",
+    AGSE_ACTIVE_ISSUE_TITLE_INCLUDES: "AGSE workflow verification,20260701",
+  });
+
+  assert.deepEqual(scope, {
+    issueNumbers: [60, 61],
+    titleIncludes: ["AGSE workflow verification", "20260701"],
+  });
+  assert.equal(polling.issueScopeIsActive(scope), true);
+});
+
+test("parseIssueScopeFromEnv rejects invalid active issue numbers", () => {
+  assert.throws(
+    () =>
+      polling.parseIssueScopeFromEnv({
+        AGSE_ACTIVE_ISSUE_NUMBERS: "60,nope",
+      }),
+    /positive issue numbers/,
   );
 });
 

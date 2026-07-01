@@ -45,6 +45,11 @@ type IssueAutomationInput = {
   localGitHubLogin: string | null;
 };
 
+export type AGSCIssueScope = {
+  issueNumbers?: readonly number[] | ReadonlySet<number>;
+  titleIncludes?: readonly string[];
+};
+
 export type IssueAutomationResult =
   | {
       status: "tracked";
@@ -67,6 +72,8 @@ const CODEX_HANDOFF_OPTIONS: CodexWorkflowOptions = {
   useDaemonProxy: true,
   useRemoteControlDaemon: false,
   requireDaemonProxy: true,
+  useDesktopApp: false,
+  requireDesktopApp: false,
 };
 const activeCodexHandoffs = new Map<number, CodexWorkflows>();
 const terminalCodexTurnStatuses = new Set(["interrupted", "failed", "cancelled"]);
@@ -263,11 +270,16 @@ export async function syncTrackedPullRequests(
   project: AGSCProject,
   repository: GitHubRepositoryRef,
   github: GitHubApiClient,
+  options: { issueScope?: AGSCIssueScope } = {},
 ): Promise<void> {
   const stateStore = new AGSCStateStore(project.rootPath);
   const state = await stateStore.read();
 
   for (const workflow of state.workflows) {
+    if (!workflowMatchesIssueScope(workflow, options.issueScope)) {
+      continue;
+    }
+
     if (!workflow.pullNumber) {
       continue;
     }
@@ -379,6 +391,7 @@ export async function recoverTrackedPullRequests(
   project: AGSCProject,
   repository: GitHubRepositoryRef,
   github: GitHubApiClient,
+  options: { issueScope?: AGSCIssueScope } = {},
 ): Promise<AGSCTrackedWorkflow[]> {
   const pullRequests = await github.listOpenPullRequests(repository);
   const stateStore = new AGSCStateStore(project.rootPath);
@@ -392,6 +405,10 @@ export async function recoverTrackedPullRequests(
     const metadata = parsePullRequestMetadata(pullRequest.body);
 
     if (!metadata) {
+      continue;
+    }
+
+    if (!pullRequestMetadataMatchesIssueScope(metadata, pullRequest, options.issueScope)) {
       continue;
     }
 
@@ -683,6 +700,86 @@ function workflowNeedsAgentStart(workflow: AGSCTrackedWorkflow): boolean {
         workflow.agentHandoffVersion !== CODEX_HANDOFF_PROMPT_VERSION)) ||
     (workflow.agent === "claude" && !workflow.claudeSessionId)
   );
+}
+
+export function issueScopeIsActive(scope: AGSCIssueScope | undefined): boolean {
+  return Boolean(
+    scope &&
+      ((scope.issueNumbers &&
+        Array.from(scope.issueNumbers).some((issueNumber) =>
+          Number.isInteger(issueNumber),
+        )) ||
+        (scope.titleIncludes?.some((title) => title.trim().length > 0) ?? false)),
+  );
+}
+
+function workflowMatchesIssueScope(
+  workflow: AGSCTrackedWorkflow,
+  scope: AGSCIssueScope | undefined,
+): boolean {
+  if (!issueScopeIsActive(scope)) {
+    return true;
+  }
+
+  return issueMetadataMatchesScope(
+    workflow.issueNumber,
+    [workflow.issueTitle],
+    scope,
+  );
+}
+
+function pullRequestMetadataMatchesIssueScope(
+  metadata: AGSCPullRequestMetadata,
+  pullRequest: GitHubPullRequest,
+  scope: AGSCIssueScope | undefined,
+): boolean {
+  if (!issueScopeIsActive(scope)) {
+    return true;
+  }
+
+  return issueMetadataMatchesScope(
+    metadata.issueNumber,
+    [metadata.issueTitle, pullRequest.title],
+    scope,
+  );
+}
+
+export function issueMatchesIssueScope(
+  issue: Pick<GitHubIssue, "number" | "title">,
+  scope: AGSCIssueScope | undefined,
+): boolean {
+  if (!issueScopeIsActive(scope)) {
+    return true;
+  }
+
+  return issueMetadataMatchesScope(issue.number, [issue.title], scope);
+}
+
+function issueMetadataMatchesScope(
+  issueNumber: number,
+  titles: readonly (string | undefined)[],
+  scope: AGSCIssueScope | undefined,
+): boolean {
+  if (!scope) {
+    return true;
+  }
+
+  const issueNumbers = new Set(scope.issueNumbers ?? []);
+
+  if (issueNumbers.has(issueNumber)) {
+    return true;
+  }
+
+  const normalizedTitles = titles
+    .filter((title): title is string => typeof title === "string")
+    .map((title) => title.toLowerCase());
+
+  return (scope.titleIncludes ?? [])
+    .map((needle) => needle.trim().toLowerCase())
+    .filter((needle) => needle.length > 0)
+    .some((needle) =>
+      normalizedTitles.some((title) => title.includes(needle)),
+    );
 }
 
 function selectAgent(
@@ -1987,7 +2084,7 @@ async function verifyCodexThreadIsDiscoverable(
           return;
         }
       } catch {
-        // The Desktop app-server can lag briefly after background thread creation.
+        // The durable app-server can lag briefly after background thread creation.
       }
 
       if (attempt < 30) {
@@ -3103,7 +3200,11 @@ export const __testing = {
   isAGSCComment,
   mergeSyncedEventIds,
   isRecoverableCodexSteerError,
+  issueMatchesIssueScope,
+  issueScopeIsActive,
+  pullRequestMetadataMatchesIssueScope,
   selectAgent,
   slugify,
+  workflowMatchesIssueScope,
   workflowNeedsAgentStart,
 };
